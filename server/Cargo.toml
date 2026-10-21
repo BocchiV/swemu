@@ -1,0 +1,20 @@
+[package]
+name = "swemu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes = "0.8"
+anyhow = "1.0.104"
+argon2 = { version = "0.5", features = ["std"] }
+bytes = "1.12.1"
+ctr = "0.9"
+futures-util = { version = "0.3.34", features = ["sink"] }
+getrandom = "0.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["codec"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

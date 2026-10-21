@@ -1,0 +1,30 @@
+# build
+target/
+
+# generated from your own client (see README)
+server/src/gamedata.rs
+server/src/wire/tables.rs
+server/src/wire/golden.rs
+
+# local runtime data
+run/
+*.db
+*.db-wal
+*.db-shm
+swemu.json
+*.log
+
+# game files and extracted data
+re/targets/
+re/out/
+*.dll
+*.exe
+*.v
+*.res
+*.pdb
+*.dmp
+
+# python
+.venv/
+__pycache__/
+*.pyc
