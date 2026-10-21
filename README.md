@@ -11,6 +11,9 @@ against the 2.3.34.7 client's own packet readers (run under Unicorn, see `re/`).
 > owners. This repository contains **no game files and no game data**: you need
 > your own copy of the client.
 
+**Discord:** [swemu Development](https://discord.gg/pawFNMPMty) for protocol notes, packet captures, bug
+reports and screenshots of swemu in action.
+
 ## Status
 
 | Area | State |
@@ -96,7 +99,7 @@ encryption and runs every server reply through the client's packet reader.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Rust is preferred, but C++/C# code and
+See [CONTRIBUTING.md](CONTRIBUTING.md) and join the [Discord](https://discord.gg/pawFNMPMty). Rust is preferred, but C++/C# code and
 plain packet notes are welcome too; they get ported to Rust.
 
 ## License

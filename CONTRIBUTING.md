@@ -1,6 +1,6 @@
 # Contributing
 
-Three ways to help, pick whichever fits you.
+Three ways to help, pick whichever fits you. Questions and discussion: [Discord](https://discord.gg/pawFNMPMty).
 
 ## 1. Rust code (preferred)
 
@@ -26,7 +26,7 @@ Equally valuable:
 - how something behaves in the real game (screenshots, short clips, numbers),
 - packet captures of the official game for a feature that is missing.
 
-Open an issue with the `protocol` or `behaviour` label.
+Open an issue with the `protocol` or `behaviour` label, or post it in #protocol-notes / #packet-captures on [Discord](https://discord.gg/pawFNMPMty).
 
 ## Do not commit
 
