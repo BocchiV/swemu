@@ -607,11 +607,25 @@ impl Db {
     /// 0..capacity). All or nothing: None if there is not enough room.
     pub fn add_items(&self, character: u32, storage: u8, capacity: u16, items: &[(u32, u16)]) -> Result<Option<Vec<ItemRecord>>> {
         let tx = self.conn.unchecked_transaction()?;
+        let Some(added) = Self::add_items_in_tx(&tx, character, storage, capacity, items)? else {
+            return Ok(None);
+        };
+        tx.commit()?;
+        Ok(Some(added))
+    }
+
+    fn add_items_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        character: u32,
+        storage: u8,
+        capacity: u16,
+        items: &[(u32, u16)],
+    ) -> Result<Option<Vec<ItemRecord>>> {
         let used: std::collections::HashSet<u16> = tx
             .prepare("SELECT slot FROM item WHERE character_id=?1 AND storage=?2")?
             .query_map(params![character, storage], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        let mut free = (0..capacity).filter(|s| !used.contains(s));
+        let mut free = (0..capacity).filter(|slot| !used.contains(slot));
         let mut added = Vec::with_capacity(items.len());
         for &(item_id, count) in items {
             let Some(slot) = free.next() else { return Ok(None) };
@@ -621,8 +635,45 @@ impl Db {
             )?;
             added.push(ItemRecord { serial: tx.last_insert_rowid() as u64, storage, slot, item_id, count });
         }
-        tx.commit()?;
         Ok(Some(added))
+    }
+
+    /// Charge the account and deliver every cash-shop line in one transaction.
+    pub fn buy_cash_order(
+        &self,
+        account: u32,
+        character: u32,
+        deliveries: &[CashBuyDelivery],
+        total: u32,
+        start_cash: u32,
+        unlimited: bool,
+    ) -> Result<CashBuyOutcome> {
+        let tx = self.conn.unchecked_transaction()?;
+        if !unlimited {
+            let charged = tx.execute(
+                "UPDATE account SET cash=COALESCE(cash, ?1)-?2 WHERE id=?3 AND COALESCE(cash, ?1)>=?2",
+                params![start_cash, total, account],
+            )?;
+            if charged != 1 {
+                return Ok(CashBuyOutcome::NotEnoughCash);
+            }
+        }
+        let item_count = deliveries.iter().map(|delivery| delivery.items.len()).sum();
+        let mut added = Vec::with_capacity(item_count);
+        for delivery in deliveries {
+            let Some(items) = Self::add_items_in_tx(
+                &tx,
+                character,
+                delivery.storage,
+                delivery.capacity,
+                &delivery.items,
+            )? else {
+                return Ok(CashBuyOutcome::BagFull);
+            };
+            added.extend(items);
+        }
+        tx.commit()?;
+        Ok(CashBuyOutcome::Delivered(added))
     }
 
     pub fn account_name(&self, account: u32) -> Result<Option<String>> {
@@ -1068,6 +1119,20 @@ pub enum RepurchaseOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CashBuyDelivery {
+    pub storage: u8,
+    pub capacity: u16,
+    pub items: Vec<(u32, u16)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CashBuyOutcome {
+    Delivered(Vec<ItemRecord>),
+    NotEnoughCash,
+    BagFull,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShopBuyOutcome {
     Bought { changed: Vec<ItemRecord>, balance: u64 },
     NotEnoughZenny,
@@ -1214,6 +1279,54 @@ mod tests {
         assert_eq!(db.add_items(id, 4, 3, &[(102, 1)]).unwrap().unwrap()[0].slot, 2);
         assert!(db.delete_character(a, id).unwrap());
         assert!(db.items(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cash_shop_order_delivery_and_charge_are_atomic() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("cash-shop").unwrap();
+        let request = NewCharacter {
+            name: "CashShop",
+            class: 1,
+            appearance: [0x44d, 0x835, 0x13ed, 0xc1d],
+            class_ref: 1001,
+            outfit: 111,
+        };
+        let CreateOutcome::Created { id: character, .. } = db.create_character(account, &request, 1, 12).unwrap() else { panic!() };
+
+        let deliveries = [
+            CashBuyDelivery { storage: 2, capacity: 1, items: vec![(6000451, 1)] },
+            CashBuyDelivery { storage: 3, capacity: 1, items: vec![(6000452, 1)] },
+        ];
+        let CashBuyOutcome::Delivered(added) =
+            db.buy_cash_order(account, character, &deliveries, 200, 1000, false).unwrap()
+        else {
+            panic!("funded order should deliver");
+        };
+        assert_eq!(added.len(), 2);
+        assert_eq!(db.cash(account, 1000).unwrap(), 800);
+
+        let bag_full_order = [
+            CashBuyDelivery { storage: 4, capacity: 1, items: vec![(6000453, 1)] },
+            CashBuyDelivery { storage: 2, capacity: 1, items: vec![(6000454, 1)] },
+        ];
+        assert_eq!(
+            db.buy_cash_order(account, character, &bag_full_order, 100, 1000, false).unwrap(),
+            CashBuyOutcome::BagFull
+        );
+        assert_eq!(db.cash(account, 1000).unwrap(), 800, "bag-full order must roll back its charge");
+
+        let insufficient_order = [
+            CashBuyDelivery { storage: 5, capacity: 1, items: vec![(6000455, 1)] },
+        ];
+        assert_eq!(
+            db.buy_cash_order(account, character, &insufficient_order, 900, 1000, false).unwrap(),
+            CashBuyOutcome::NotEnoughCash
+        );
+        let items = db.items(character).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(!items.iter().any(|item| matches!(item.item_id, 6000453..=6000455)));
+        assert_eq!(db.cash(account, 1000).unwrap(), 800);
     }
 
     #[test]

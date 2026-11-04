@@ -20,7 +20,7 @@ reports and screenshots of swemu in action.
 |---|---|
 | Login, server list, character create/delete/select, 2nd password (PIN) | basic version works, needs further development |
 | World entry, towns, NPCs, NPC shops, buy/sell/buyback, repair | basic version works, needs further development |
-| Inventory, equip, bag tools, item boxes, cash shop catalogue | basic version works, needs further development |
+| Inventory, equip, bag tools, item boxes, cash shop catalogue and atomic item delivery | basic version works, needs further development |
 | Chat, gestures, GM commands (`/help`) | basic version works, needs further development |
 | Maze (dungeon) entry/exit, all mazes enterable, sectors, portals | basic version works, needs further development |
 | Level / EXP, drops and loot pickup | basic version works, needs further development |
@@ -80,13 +80,16 @@ uses level-based fallbacks where it can.
 
 ## Tests
 
-```
-cd server && cargo test                      # unit tests (need the generated files)
-python re/e2e_client.py --host <ip> --port 15001 --aes --gm-user <gm account>
+Run from the repository root:
+
+```powershell
+cargo test --manifest-path server/Cargo.toml cash_shop_order_delivery_and_charge_are_atomic
+python re/e2e_client.py --host <server LAN IP> --port <login port> --aes --gm-user <test login> --cash-shop-only
 ```
 
-`e2e_client.py` plays the whole flow (login to maze combat) with the client's own
-encryption and runs every server reply through the client's packet reader.
+Before E2E, add the test login to `gm_accounts` in `server/swemu.json` and use
+a fresh test database. The focused scenario checks cash-shop order delivery,
+rejection without partial purchase, and the Wings of Purity costume refresh.
 
 ## Layout
 

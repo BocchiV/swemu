@@ -1065,37 +1065,66 @@ fn send_cash_shop(s: &mut Session) {
 fn cash_buy(s: &mut Session, character: u32, req: &proto::CashBuyReq) {
     let Some(account) = s.account_id else { return };
     let (unlimited, start) = (s.shared.cfg.unlimited_cash, s.shared.cfg.start_cash);
-    let mut delivered = Vec::new();
+    let mut deliveries = Vec::with_capacity(req.items.len());
+    let mut total = 0u32;
+    let mut valid = true;
     for &(shop_id, option, qty) in &req.items {
-        let Some(p) = crate::gamedata::CASH_SHOP.iter().find(|p| p.0 == shop_id) else {
-            warn!(conn = s.id, shop_id, "cash shop buy: unknown product");
-            continue;
+        let Some(product) = crate::gamedata::CASH_SHOP.iter().find(|product| product.0 == shop_id) else {
+            warn!(conn = s.id, shop_id, "cash shop buy rejected: unknown product");
+            valid = false;
+            break;
         };
-        let Some(&(item, count, _, price)) = p.4.get(option as usize).or(p.4.first()) else { continue };
+        let Some(&(item, count, _, price)) = product.4.get(option as usize) else {
+            warn!(conn = s.id, shop_id, option, "cash shop buy rejected: invalid billing option");
+            valid = false;
+            break;
+        };
         let qty = qty.clamp(1, 99);
-        let total = price.saturating_mul(u32::from(qty));
+        let Some(next_total) = price
+            .checked_mul(u32::from(qty))
+            .and_then(|line_total| total.checked_add(line_total))
+        else {
+            warn!(conn = s.id, shop_id, qty, "cash shop buy rejected: order total overflow");
+            valid = false;
+            break;
+        };
+        total = next_total;
         let storage = proto::cash_item_storage(item);
         let capacity = proto::storage_slots(storage) as u16;
         let items = vec![(item, count.max(1)); qty as usize];
-        let db = s.shared.db.lock().unwrap();
-        if !unlimited && db.cash(account, start).unwrap_or(0) < total {
-            drop(db);
-            warn!(conn = s.id, shop_id, total, "cash shop buy refused: not enough cash");
-            continue;
-        }
-        let result = db.add_items(character, storage, capacity, &items);
-        match result {
-            Ok(Some(added)) => {
-                if !unlimited {
-                    let _ = db.spend_cash(account, total, start);
-                }
-                delivered.extend(added);
-            }
-            Ok(None) => warn!(conn = s.id, shop_id, storage, "cash shop buy: bag full"),
-            Err(e) => warn!(conn = s.id, shop_id, error = %e, "cash shop buy: db error"),
-        }
+        deliveries.push(crate::db::CashBuyDelivery { storage, capacity, items });
     }
-    info!(conn = s.id, character, products = ?req.items, delivered = delivered.len(), "cash shop buy");
+    let delivered = if valid {
+        let result = s.shared.db.lock().unwrap().buy_cash_order(
+            account,
+            character,
+            &deliveries,
+            total,
+            start,
+            unlimited,
+        );
+        match result {
+            Ok(crate::db::CashBuyOutcome::Delivered(added)) => added.len(),
+            Ok(crate::db::CashBuyOutcome::NotEnoughCash) => {
+                warn!(conn = s.id, total, "cash shop order refused: not enough cash");
+                0
+            }
+            Ok(crate::db::CashBuyOutcome::BagFull) => {
+                warn!(conn = s.id, "cash shop order refused: bag full");
+                0
+            }
+            Err(e) => {
+                warn!(conn = s.id, error = %e, "cash shop order failed");
+                0
+            }
+        }
+    } else {
+        0
+    };
+    if !valid {
+        warn!(conn = s.id, products = ?req.items, "cash shop order rejected");
+    }
+    info!(conn = s.id, character, products = ?req.items, delivered, "cash shop buy");
     s.send(MAIN_SHOP, 0x21, proto::cash_buy_res());
     send_inventory(s);
     send_cash_balance(s);
@@ -1297,6 +1326,7 @@ fn use_item(s: &mut Session, character: u32, req: &proto::ItemUseReq) {
             s.send(MAIN_ITEM, 0x15, proto::item_update(&update));
             let got: Vec<(u32, u16)> = added.iter().map(|i| (i.item_id, i.count)).collect();
             s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &got));
+            send_inventory(s);
         }
         Ok(None) => warn!(conn = s.id, item_id, "item use: bag full"),
         Err(e) => warn!(conn = s.id, item_id, error = %e, "item use: db error"),
