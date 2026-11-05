@@ -9,6 +9,14 @@ pub struct Db {
     conn: Connection,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ItemUseCurrency {
+    Zenny,
+    SoulVapor,
+    Bp,
+    Ether,
+}
+
 /// Current schema layout (see `migrate_v2` and docs/database.md).
 pub const SCHEMA_VERSION: i64 = 2;
 
@@ -478,41 +486,123 @@ impl Db {
         Ok(n == 1)
     }
 
-    /// Use one of an item (by serial): delete it or lower its count, then put
-    /// `gain` (item, count, storage, capacity) into free slots. All or nothing.
-    /// Returns (the used item with its remaining count, the added items), or
-    /// None if the item is not the character's or the bags are full.
-    pub fn use_item(&self, character: u32, serial: u64, gain: &[(u32, u16, u8, u16)]) -> Result<Option<(ItemRecord, Vec<ItemRecord>)>> {
+    /// Use one item and insert any item rewards in the same transaction.
+    /// `None` means the item was stale or the reward bag had no free slot.
+    pub fn use_item(
+        &self,
+        character: u32,
+        serial: u64,
+        gain: &[(u32, u16, u8, u16)],
+    ) -> Result<Option<(ItemRecord, Vec<ItemRecord>)>> {
+        Ok(self
+            .use_item_inner(character, serial, None, gain, None, 0)?
+            .map(|(used, added, _)| (used, added)))
+    }
+
+    /// Consume an item at the requested location and grant items/currency atomically.
+    pub(crate) fn use_item_with_currency(
+        &self,
+        character: u32,
+        serial: u64,
+        at: (u8, u16),
+        gain: &[(u32, u16, u8, u16)],
+        currency: Option<(ItemUseCurrency, u64)>,
+        start_zenny: u64,
+    ) -> Result<Option<(ItemRecord, Vec<ItemRecord>, Option<u64>)>> {
+        self.use_item_inner(character, serial, Some(at), gain, currency, start_zenny)
+    }
+
+    fn use_item_inner(
+        &self,
+        character: u32,
+        serial: u64,
+        at: Option<(u8, u16)>,
+        gain: &[(u32, u16, u8, u16)],
+        currency: Option<(ItemUseCurrency, u64)>,
+        start_zenny: u64,
+    ) -> Result<Option<(ItemRecord, Vec<ItemRecord>, Option<u64>)>> {
         let tx = self.conn.unchecked_transaction()?;
         let row = tx
             .query_row(
                 "SELECT storage, slot, item_id, count FROM item WHERE id=?1 AND character_id=?2",
                 params![serial as i64, character],
-                |r| Ok((r.get::<_, u8>(0)?, r.get::<_, u16>(1)?, r.get::<_, u32>(2)?, r.get::<_, u16>(3)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, u8>(0)?,
+                        r.get::<_, u16>(1)?,
+                        r.get::<_, u32>(2)?,
+                        r.get::<_, u16>(3)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((storage, slot, item_id, count)) = row else { return Ok(None) };
+        let Some((storage, slot, item_id, count)) = row else {
+            return Ok(None);
+        };
+        if at.is_some_and(|expected| expected != (storage, slot)) {
+            return Ok(None);
+        }
         let left = count.saturating_sub(1);
         if left == 0 {
             tx.execute("DELETE FROM item WHERE id=?1", params![serial as i64])?;
         } else {
             tx.execute("UPDATE item SET count=?1 WHERE id=?2", params![left, serial as i64])?;
         }
+
         let mut added = Vec::with_capacity(gain.len());
         for &(gid, gcount, gstorage, capacity) in gain {
             let used: std::collections::HashSet<u16> = tx
                 .prepare("SELECT slot FROM item WHERE character_id=?1 AND storage=?2")?
                 .query_map(params![character, gstorage], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
-            let Some(gslot) = (0..capacity).find(|s| !used.contains(s)) else { return Ok(None) };
+            let Some(gslot) = (0..capacity).find(|slot| !used.contains(slot)) else {
+                return Ok(None);
+            };
             tx.execute(
                 "INSERT INTO item(character_id, storage, slot, item_id, count) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![character, gstorage, gslot, gid, gcount],
             )?;
-            added.push(ItemRecord { serial: tx.last_insert_rowid() as u64, storage: gstorage, slot: gslot, item_id: gid, count: gcount });
+            added.push(ItemRecord {
+                serial: tx.last_insert_rowid() as u64,
+                storage: gstorage,
+                slot: gslot,
+                item_id: gid,
+                count: gcount,
+            });
         }
+
+        let currency_total = match currency {
+            Some((currency, amount)) => {
+                let (column, initial) = match currency {
+                    ItemUseCurrency::Zenny => ("zenny", start_zenny.min(i64::MAX as u64)),
+                    ItemUseCurrency::SoulVapor => ("soul_vapor", 0),
+                    ItemUseCurrency::Bp => ("bp", 0),
+                    ItemUseCurrency::Ether => ("ether", 0),
+                };
+                let current: Option<i64> = tx.query_row(
+                    &format!("SELECT {column} FROM character WHERE id=?1"),
+                    params![character],
+                    |r| r.get(0),
+                )?;
+                let total = current
+                    .map_or(initial, |value| value.max(0) as u64)
+                    .saturating_add(amount)
+                    .min(i64::MAX as u64);
+                let changed = tx.execute(
+                    &format!("UPDATE character SET {column}=?1 WHERE id=?2"),
+                    params![total as i64, character],
+                )?;
+                anyhow::ensure!(changed == 1, "use-item currency character row missing");
+                Some(total)
+            }
+            None => None,
+        };
         tx.commit()?;
-        Ok(Some((ItemRecord { serial, storage, slot, item_id, count: left }, added)))
+        Ok(Some((
+            ItemRecord { serial, storage, slot, item_id, count: left },
+            added,
+            currency_total,
+        )))
     }
 
     /// Write the starter costume (shape slot -> item) as worn items, once per
@@ -1356,6 +1446,73 @@ mod tests {
         let b2 = db.add_items(id, 13, 384, &[(6000451, 1)]).unwrap().unwrap()[0];
         assert!(db.use_item(id, b2.serial, &[(1, 1, 4, 1)]).unwrap().is_none());
         assert_eq!(db.items(id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn random_box_item_and_currency_changes_are_atomic() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("random-box").unwrap();
+        let new_character = |name| NewCharacter {
+            name,
+            class: 1,
+            appearance: [0x44d, 0x835, 0x13ed, 0xc1d],
+            class_ref: 1001,
+            outfit: 111,
+        };
+        let CreateOutcome::Created { id, .. } =
+            db.create_character(account, &new_character("Box"), 1, 12).unwrap()
+        else {
+            panic!()
+        };
+        let boxed = db.add_items(id, 13, 384, &[(991000994, 1)]).unwrap().unwrap()[0];
+        assert_eq!(db.zenny(id, 1_000).unwrap(), 1_000);
+
+        let wrong_location = db
+            .use_item_with_currency(
+                id,
+                boxed.serial,
+                (boxed.storage, boxed.slot + 1),
+                &[],
+                Some((ItemUseCurrency::Bp, 250)),
+                1_000,
+            )
+            .unwrap();
+        assert!(wrong_location.is_none(), "stale location must not consume the box");
+        assert_eq!(db.currencies(id).unwrap().1, 0);
+        assert!(db.items(id).unwrap().iter().any(|item| item.serial == boxed.serial && item.count == 1));
+
+        let occupied = db.add_items(id, 2, 1, &[(800000999, 1)]).unwrap().unwrap()[0];
+        assert_eq!(occupied.slot, 0);
+        let failed = db
+            .use_item_with_currency(
+                id,
+                boxed.serial,
+                (boxed.storage, boxed.slot),
+                &[(800000999, 1, 2, 1)],
+                Some((ItemUseCurrency::Bp, 250)),
+                1_000,
+            )
+            .unwrap();
+        assert!(failed.is_none(), "full reward bag must roll back box and currency");
+        assert_eq!(db.currencies(id).unwrap().1, 0);
+        assert!(db.items(id).unwrap().iter().any(|item| item.serial == boxed.serial && item.count == 1));
+
+        let (used, added, total) = db
+            .use_item_with_currency(
+                id,
+                boxed.serial,
+                (boxed.storage, boxed.slot),
+                &[],
+                Some((ItemUseCurrency::Zenny, 500)),
+                1_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(used.count, 0);
+        assert!(added.is_empty());
+        assert_eq!(total, Some(1_500));
+        assert_eq!(db.zenny(id, 1_000).unwrap(), 1_500);
+        assert!(db.items(id).unwrap().iter().all(|item| item.serial != boxed.serial));
     }
 
     #[test]
