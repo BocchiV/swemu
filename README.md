@@ -88,6 +88,9 @@ python re/e2e_client.py --host <ip> --port 15001 --aes --gm-user <gm account>
 `e2e_client.py` plays the whole flow (login to maze combat) with the client's own
 encryption and runs every server reply through the client's packet reader.
 
+With `--gm-user`, the E2E path also opens random box 991000994 and verifies a
+client-table Gruton Coin outcome in the refreshed inventory.
+
 ## Layout
 
 | Path | Purpose |

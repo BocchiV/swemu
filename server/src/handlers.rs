@@ -1265,8 +1265,38 @@ fn line_up(s: &mut Session, character: u32, st: u8) {
     }
 }
 
-/// ITEM_USE: boxes (tb_Item_Package) are swapped for their contents. Anything
-/// else is answered with an empty use so the client does not wait.
+fn choose_random_box_outcome(outcomes: &[(u32, u32, u16)], mut roll: u32) -> Option<(u32, u32)> {
+    for &(item_id, count, weight) in outcomes {
+        let weight = u32::from(weight);
+        if roll < weight {
+            return Some((item_id, count));
+        }
+        roll -= weight;
+    }
+    None
+}
+
+fn roll_random_box_outcome(
+    outcomes: &[(u32, u32, u16)],
+) -> std::result::Result<Option<(u32, u32)>, getrandom::Error> {
+    let total: u32 = outcomes.iter().map(|entry| u32::from(entry.2)).sum();
+    if total == 0 {
+        return Ok(None);
+    }
+    // Rejection sampling avoids modulo bias while keeping the draw allocation-free.
+    let limit = u32::MAX - u32::MAX % total;
+    loop {
+        let mut bytes = [0u8; 4];
+        getrandom::getrandom(&mut bytes)?;
+        let draw = u32::from_le_bytes(bytes);
+        if draw < limit {
+            return Ok(choose_random_box_outcome(outcomes, draw % total));
+        }
+    }
+}
+
+/// ITEM_USE: client weighted random boxes take precedence over fixed packages.
+/// Item and wallet rewards are committed atomically with consuming the box.
 fn use_item(s: &mut Session, character: u32, req: &proto::ItemUseReq) {
     let item_id = {
         let items = s.shared.db.lock().unwrap().items(character).unwrap_or_default();
@@ -1276,6 +1306,119 @@ fn use_item(s: &mut Session, character: u32, req: &proto::ItemUseReq) {
         warn!(conn = s.id, serial = req.serial, storage = req.storage, slot = req.slot, "item use: not this character's item");
         return;
     };
+
+    if let Ok(index) = crate::gamedata::ITEM_RANDOM_BOXES
+        .binary_search_by_key(&item_id, |entry| entry.0)
+    {
+        let outcomes = crate::gamedata::ITEM_RANDOM_BOXES[index].1;
+        let (reward_id, reward_count) = match roll_random_box_outcome(outcomes) {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                warn!(conn = s.id, item_id, "item use: random box has no weighted outcome");
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
+                return;
+            }
+            Err(error) => {
+                warn!(conn = s.id, item_id, error = %error, "item use: random box RNG failed");
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
+                return;
+            }
+        };
+        let currency = match reward_id {
+            proto::DROP_ZENNY => Some(crate::db::ItemUseCurrency::Zenny),
+            proto::DROP_SOUL_VAPOR => Some(crate::db::ItemUseCurrency::SoulVapor),
+            proto::DROP_BP => Some(crate::db::ItemUseCurrency::Bp),
+            proto::DROP_ETHER => Some(crate::db::ItemUseCurrency::Ether),
+            _ => None,
+        };
+        let mut gain = Vec::new();
+        if reward_id != 0 && currency.is_none() {
+            if reward_count == 0 {
+                warn!(conn = s.id, item_id, reward_id, "item use: random box reward has zero count");
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
+                return;
+            }
+            let storage = proto::cash_item_storage(reward_id);
+            let capacity = proto::storage_slots(storage).max(0) as u16;
+            let stack_max = proto::item_prices(reward_id)
+                .map_or(u16::MAX, |(_, _, stack)| stack.max(1));
+            let stack_size = u32::from(stack_max);
+            let extra_slot = if reward_count % stack_size == 0 { 0 } else { 1 };
+            let slots_needed = reward_count / stack_size + extra_slot;
+            if capacity == 0 || slots_needed > u32::from(capacity) {
+                warn!(conn = s.id, item_id, reward_id, reward_count, storage, "item use: random-box reward exceeds bag capacity");
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
+                return;
+            }
+            gain.reserve_exact(slots_needed as usize);
+            let mut remaining = reward_count;
+            while remaining > 0 {
+                let count = remaining.min(stack_size) as u16;
+                gain.push((reward_id, count, storage, capacity));
+                remaining -= u32::from(count);
+            }
+        }
+        let currency_reward = currency.map(|kind| (kind, u64::from(reward_count)));
+        let start_zenny = s.shared.cfg.start_zenny;
+        let result = s.shared.db.lock().unwrap().use_item_with_currency(
+            character,
+            req.serial,
+            (req.storage, req.slot),
+            &gain,
+            currency_reward,
+            start_zenny,
+        );
+        match result {
+            Ok(Some((used, added, currency_total))) => {
+                let mut update = Vec::with_capacity(1 + added.len());
+                update.push(used);
+                update.extend(added.iter().copied());
+                s.send(MAIN_ITEM, 0x15, proto::item_update(&update));
+                let currency_items = if currency.is_some() {
+                    reward_count.div_ceil(u32::from(u16::MAX)) as usize
+                } else {
+                    0
+                };
+                let mut got = Vec::with_capacity(added.len() + currency_items);
+                got.extend(added.iter().map(|item| (item.item_id, item.count)));
+                if currency.is_some() {
+                    let mut remaining = reward_count;
+                    while remaining > 0 {
+                        let count = remaining.min(u32::from(u16::MAX)) as u16;
+                        got.push((reward_id, count));
+                        remaining -= u32::from(count);
+                    }
+                }
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &got));
+                if let (Some(currency), Some(total)) = (currency, currency_total) {
+                    match currency {
+                        crate::db::ItemUseCurrency::Zenny => {
+                            s.send(MAIN_ITEM, 0x20, proto::update_money(total));
+                        }
+                        crate::db::ItemUseCurrency::SoulVapor => {
+                            let sv = total.min(100) as f32;
+                            s.send(
+                                MAIN_CHARACTER,
+                                0x34,
+                                proto::stat_list(character, &[(proto::stat::SV_CUR, sv)]),
+                            );
+                        }
+                        crate::db::ItemUseCurrency::Bp => {
+                            s.send(MAIN_ITEM, 0x31, proto::update_bp(character, total));
+                        }
+                        crate::db::ItemUseCurrency::Ether => {
+                            s.send(MAIN_ITEM, 0x32, proto::update_ether(total));
+                        }
+                    }
+                }
+                send_inventory(s);
+                info!(conn = s.id, item_id, reward_id, reward_count, "item use: random box opened");
+            }
+            Ok(None) => warn!(conn = s.id, item_id, "item use: stale random box or bag full"),
+            Err(error) => warn!(conn = s.id, item_id, error = %error, "item use: random box database error"),
+        }
+        return;
+    }
     let Some(&(_, contents)) = crate::gamedata::ITEM_PACKAGE.iter().find(|p| p.0 == item_id) else {
         info!(conn = s.id, item_id, "item use: not a box (no effect implemented)");
         s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
@@ -1603,4 +1746,36 @@ fn enter_server(s: &mut Session, req: EnterServerReq) {
     s.session_key = Some(req.session);
     info!(conn = s.id, account = req.account_id, "entered game server");
     s.send(MAIN_LOGIN, 0x14, proto::enter_server_res(0, req.account_id));
+}
+
+#[cfg(test)]
+mod random_box_tests {
+    use super::choose_random_box_outcome;
+    use crate::gamedata::ITEM_RANDOM_BOXES;
+
+    #[test]
+    fn gold_gruton_jar_uses_client_weights() {
+        let outcomes = ITEM_RANDOM_BOXES
+            .iter()
+            .find(|entry| entry.0 == 991000994)
+            .unwrap()
+            .1;
+        assert_eq!(outcomes.iter().map(|entry| u32::from(entry.2)).sum::<u32>(), 10_000);
+        assert_eq!(choose_random_box_outcome(outcomes, 0), Some((800000999, 10)));
+        assert_eq!(choose_random_box_outcome(outcomes, 1_999), Some((800000999, 10)));
+        assert_eq!(choose_random_box_outcome(outcomes, 2_000), Some((800000999, 25)));
+        assert_eq!(choose_random_box_outcome(outcomes, 4_500), Some((800000999, 35)));
+        assert_eq!(choose_random_box_outcome(outcomes, 9_999), Some((800000999, 500)));
+        assert_eq!(choose_random_box_outcome(outcomes, 10_000), None);
+    }
+
+    #[test]
+    fn weighted_blank_outcomes_are_preserved_and_zero_weights_skipped() {
+        let outcomes = [(0, 0, 3), (123, 5, 0), (800000999, 25, 2)];
+        assert_eq!(choose_random_box_outcome(&outcomes, 0), Some((0, 0)));
+        assert_eq!(choose_random_box_outcome(&outcomes, 2), Some((0, 0)));
+        assert_eq!(choose_random_box_outcome(&outcomes, 3), Some((800000999, 25)));
+        assert_eq!(choose_random_box_outcome(&outcomes, 5), None);
+        assert_eq!(choose_random_box_outcome(&[], 0), None);
+    }
 }

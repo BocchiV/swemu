@@ -418,6 +418,62 @@ def main():
         m, sub, p = w3.recv()
         assert (m, sub) == (1, 0x06), ("non-GM must get no reply to 7/0x0A", m, sub)
         print("[ok] GM 7/0x0A from a non-GM account is ignored")
+
+    if gm_expected:
+        random_grant = gm_cmd(w3, "/item 991000994 1", {(7, 0x01)})
+        random_payload = random_grant[(8, 0x15)][0]
+        random_records = [
+            (
+                random_payload[4 + i * 118],
+                struct.unpack_from("<H", random_payload, 4 + i * 118 + 1)[0],
+                struct.unpack_from("<I", random_payload, 4 + i * 118 + 3)[0],
+                struct.unpack_from("<Q", random_payload, 4 + i * 118 + 7)[0],
+                struct.unpack_from("<H", random_payload, 4 + i * 118 + 15)[0],
+            )
+            for i in range(struct.unpack_from("<I", random_payload, 0)[0])
+        ]
+        box = next((entry for entry in random_records if entry[2] == 991000994), None)
+        assert box is not None and box[4] == 1, random_records
+        w3.send(8, 0x11, struct.pack("<BHQB", box[0], box[1], box[3], 1))
+        m, sub, payload = w3.recv()
+        assert (m, sub) == (8, 0x15), (m, sub)
+        updates = [
+            (
+                struct.unpack_from("<I", payload, 4 + i * 118 + 3)[0],
+                struct.unpack_from("<H", payload, 4 + i * 118 + 15)[0],
+            )
+            for i in range(struct.unpack_from("<I", payload, 0)[0])
+        ]
+        reward = next(
+            (count for item, count in updates
+             if item == 800000999 and count in {10, 25, 35, 50, 75, 100, 180, 250, 500}),
+            None,
+        )
+        assert (991000994, 0) in updates and reward is not None, updates
+        m, sub, payload = w3.recv()
+        assert (m, sub) == (8, 0x11) and struct.unpack_from("<I", payload, 0)[0] == 991000994, \
+            (m, sub, payload[:4])
+        got_count = payload[32]
+        got = [
+            (struct.unpack_from("<I", payload, 33 + i * 7)[0],
+             struct.unpack_from("<H", payload, 37 + i * 7)[0])
+            for i in range(got_count)
+        ]
+        assert got == [(800000999, reward)], got
+        m, sub, snapshot_payload = w3.recv()
+        assert (m, sub) == (8, 0x01), (m, sub)
+        snapshot_count = struct.unpack_from("<I", snapshot_payload, 0)[0]
+        snapshot = [
+            (
+                snapshot_payload[4 + i * 118],
+                struct.unpack_from("<I", snapshot_payload, 4 + i * 118 + 3)[0],
+                struct.unpack_from("<H", snapshot_payload, 4 + i * 118 + 15)[0],
+            )
+            for i in range(snapshot_count)
+        ]
+        assert any(item == 800000999 and count == reward
+                   for _, item, count in snapshot), snapshot
+        print(f"[ok] ITEM_USE random box 991000994 -> Gruton Coin x{reward} from tb_Item_RandomBox")
     w3.send(0xF1, 0x01, b"")
     m, sub, p = w3.recv()
     assert (m, sub) == (4, 0x22) and struct.unpack_from("<H", p, 0)[0] == 36 and len(p) == 2 + 36 * 49, (m, sub, p[:2], len(p))
