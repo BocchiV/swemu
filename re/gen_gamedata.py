@@ -579,7 +579,35 @@ def main():
     # per character level (GB client tb_Levelup_Point: u8 level, i32 need,
     # u8 skill point, u8).
     import server_tables
-    jp_mons = {m["id"]: m for m in server_tables.table("tb_Monster.res", server_tables.monster)}
+    import tbgen
+
+    def optional_input(paths, label, load):
+        missing_paths = [path for path in paths if not os.path.isfile(path)]
+        if missing_paths:
+            print(
+                f"optional server inputs missing for {label}: "
+                f"{', '.join(missing_paths)}; runtime fallbacks apply where available"
+            )
+            return []
+        return load()
+
+    def server_table(name, row):
+        path = os.path.join(server_tables.RES, name)
+        return optional_input(
+            [path], name, lambda: server_tables.table(name, row)
+        )
+
+    def header_table(struct_name, name):
+        paths = [
+            os.path.join(tbgen.RES, name),
+            os.path.join(tbgen.HDR, struct_name + ".h"),
+        ]
+        return optional_input(
+            paths, f"{struct_name}/{name}",
+            lambda: tbgen.load(struct_name, name),
+        )
+
+    jp_mons = {m["id"]: m for m in server_table("tb_Monster.res", server_tables.monster)}
     used = sorted({m for r in spawn_rows for m in r[3]})
     lines += [
         "];",
@@ -590,8 +618,7 @@ def main():
         "/// Monster_Type 0/3/11 and Monster_ClearCondition_Type != 1)). Sorted by id.",
         "pub const MONSTERS: &[(u32, u8, u8, u32, u32, u32, u16, u32, bool)] = &[",
     ]
-    import tbgen
-    tbm = {r["ID"]: r for r in tbgen.load("TB_MONSTER", "tb_Monster.res")}
+    tbm = {r["ID"]: r for r in header_table("TB_MONSTER", "tb_Monster.res")}
     missing = 0
     for mid in used:
         m = jp_mons.get(mid)
@@ -603,11 +630,14 @@ def main():
             lines.append(f"    ({mid}, {m['level']}, {m['rank']}, {max(m['hp'], 0)}, {max(m['patk'], 0)}, {sk}, {speed}, {t['Monster_Sight']}, {'true' if counts else 'false'}),")
         else:
             missing += 1
-    print(f"monsters: {len(used) - missing} of {len(used)} spawned ids have stats, {missing} use derived stats (GB-only ids)")
+    print(
+        f"monsters: {len(used) - missing} of {len(used)} spawned ids have stats, "
+        f"{missing} use derived stats (missing server rows or GB-only ids)"
+    )
     # Drops (tb_Drop / tb_Drop_Group, logic CDropProcess::MakeDropItems):
     # only items that exist in the GB client's tb_Item are kept.
-    jp_drops = {r["id"]: r for r in server_tables.table("tb_Drop.res", server_tables.drop)}
-    jp_groups = {r["id"]: r for r in server_tables.table("tb_Drop_Group.res", server_tables.drop_group)}
+    jp_drops = {r["id"]: r for r in server_table("tb_Drop.res", server_tables.drop)}
+    jp_groups = {r["id"]: r for r in server_table("tb_Drop_Group.res", server_tables.drop_group)}
     drop_of = {mid: jp_mons[mid]["drop"] for mid in used if mid in jp_mons and jp_mons[mid]["drop"] in jp_drops}
     drop_rows, group_ids = [], set()
     for did in sorted(set(drop_of.values())):
@@ -634,7 +664,7 @@ def main():
     for did, gch, gmin, gmax, groups, sv, eth, bp in drop_rows:
         gs = ", ".join(f"({g}, {c})" for g, c in groups)
         lines.append(f"    ({did}, {gch}, {gmin}, {gmax}, &[{gs}], [{sv[0]}, {sv[1]}, {sv[2]}], [{eth[0]}, {eth[1]}, {eth[2]}], [{bp[0]}, {bp[1]}, {bp[2]}]),")
-    jp_maze = {r["id"]: r for r in server_tables.table("tb_Maze_Info.res", server_tables.maze_info)}
+    jp_maze = {r["id"]: r for r in server_table("tb_Maze_Info.res", server_tables.maze_info)}
     rew = [(mid, jp_maze[mid]["exp"], jp_maze[mid]["money"]) for mid, *_ in mazes if mid in jp_maze]
     print(f"maze rewards: {len(rew)} of {len(mazes)} mazes have clear EXP/Zenny, the rest use a level-based fallback")
     lines += [
@@ -654,7 +684,7 @@ def main():
     for gid in sorted(group_ids):
         its = ", ".join(f"({i}, {c}, {a}, {b})" for i, c, a, b in jp_groups[gid]["items"] if has_item(i))
         lines.append(f"    ({gid}, &[{its}]),")
-    mexp = server_tables.table("tb_Monster_EXP.res", server_tables.monster_exp)
+    mexp = server_table("tb_Monster_EXP.res", server_tables.monster_exp)
     lines += [
         "];",
         "",
@@ -667,8 +697,7 @@ def main():
     # Combat tables from the reference server (struct order via tbgen):
     # skill damage ratio / range / cooldown for every skill a GB class or a
     # spawned monster uses, and the class status rows (HP first + growth).
-    import tbgen
-    jp_skills = {r["Skill_Index"]: r for r in tbgen.load("TB_SKILL", "tb_Skill.res")}
+    jp_skills = {r["Skill_Index"]: r for r in header_table("TB_SKILL", "tb_Skill.res")}
     want = set(skill_ids(skill_tab)) | {m["skills"][0] for mid in used if (m := jp_mons.get(mid)) and m["skills"]}
     sk_rows = sorted((i, jp_skills[i]) for i in want if i in jp_skills)
     print(f"skills: {len(sk_rows)} of {len(want)} class/monster skills found in tb_Skill (others use ratio 100, range 250)")
@@ -682,7 +711,7 @@ def main():
     ]
     for i, r in sk_rows:
         lines.append(f"    ({i}, {int(max(r['Skill_Add_Damage_RAT'], 0))}, {int(max(r['Skill_Basic_Damage'] + r['Skill_Add_Damage_INT'], 0))}, {r['Skill_Range_Max']}, {r['CoolTime']}, {r['Skill_Cost_Attribute']}, {max(int(r['Skill_Cost']), 0)}),")
-    status = [r for r in tbgen.load("TB_STATUS", "tb_Status.res") if 1001 <= r["ID"] <= 1020]
+    status = [r for r in header_table("TB_STATUS", "tb_Status.res") if 1001 <= r["ID"] <= 1020]
     lines += [
         "];",
         "",
@@ -737,7 +766,7 @@ def main():
     ]
     # GB rows carry no skill-point column (the u8 after the EXP is 3 on every
     # row); the table's Give_Skill_Point is used.
-    for r in tbgen.load("TB_LEVELUP_POINT", "tb_Levelup_Point.res"):
+    for r in header_table("TB_LEVELUP_POINT", "tb_Levelup_Point.res"):
         lines.append(f"    ({r['Level']}, {r['Give_Skill_Point']}),")
     lines += ["];", ""]
     print(f"skill tree: {len(tree)} rows")
@@ -745,6 +774,8 @@ def main():
     # Monster_AI_ID) and all 10 skill slots per monster.
     import ai_scripts
     ais = ai_scripts.load()
+    if not ais:
+        print("no optional server AI scripts loaded; generated AI table will be empty")
     ai_names = sorted({(tbm[m]["Monster_AI_ID"] or "").lower() for m in used if m in tbm} & set(ais))
     ai_index = {n: i for i, n in enumerate(ai_names)}
     lines += [
