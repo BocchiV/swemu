@@ -310,16 +310,16 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
          INSERT INTO storage_capacity_v6(account_id,storage,slots)
            SELECT c.account_id, sc.storage, MAX(sc.slots) FROM storage_capacity sc
            JOIN character c ON c.id=sc.character_id GROUP BY c.account_id,sc.storage;
-         UPDATE storage_capacity_v6 SET slots=MAX(slots,(
-           SELECT COALESCE(MAX(i.slot)+1,0) FROM item_v6 i
-           WHERE i.account_id=storage_capacity_v6.account_id AND i.storage=storage_capacity_v6.storage
-         ));
          INSERT OR IGNORE INTO storage_capacity_v6(account_id,storage,slots)
            SELECT a.id, 22, 24 FROM account a;
          INSERT OR IGNORE INTO storage_capacity_v6(account_id,storage,slots)
            SELECT a.id, 23, 48 FROM account a;
          INSERT OR IGNORE INTO storage_capacity_v6(account_id,storage,slots)
            SELECT a.id, 24, 384 FROM account a;
+         UPDATE storage_capacity_v6 SET slots=MAX(slots,(
+           SELECT COALESCE(MAX(i.slot)+1,0) FROM item_v6 i
+           WHERE i.account_id=storage_capacity_v6.account_id AND i.storage=storage_capacity_v6.storage
+         ));
          DROP TABLE item;
          ALTER TABLE item_v6 RENAME TO item;
          CREATE UNIQUE INDEX item_character_slot ON item(character_id,storage,slot) WHERE character_id IS NOT NULL;
@@ -1875,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn v6_migration_rejects_unrepresentable_bank_slots_without_data_loss() {
+    fn v6_migration_handles_missing_capacity_and_rejects_unrepresentable_slots() {
         let legacy_db = || {
             let conn = Connection::open(":memory:").unwrap();
             conn.execute_batch(
@@ -1926,6 +1926,22 @@ mod tests {
         assert!(migrate_v6(&full).is_err());
         assert_eq!(full.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
         assert_eq!(full.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), 65_536);
+        let sparse = legacy_db();
+        sparse
+            .execute(
+                "INSERT INTO item(character_id,storage,slot,item_id,count,created_at)
+                 VALUES (1,22,30,1,1,0)",
+                [],
+            )
+            .unwrap();
+        migrate_v6(&sparse).unwrap();
+        let capacity = sparse
+            .query_row("SELECT slots FROM storage_capacity WHERE account_id=1 AND storage=22", [], |r| r.get::<_, u16>(0))
+            .unwrap();
+        let stored_slot = sparse
+            .query_row("SELECT slot FROM item WHERE account_id=1 AND storage=22", [], |r| r.get::<_, u16>(0))
+            .unwrap();
+        assert_eq!((capacity, stored_slot), (31, 30));
     }
 
     #[test]
