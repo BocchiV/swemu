@@ -35,12 +35,11 @@ def load_tables():
     z = zipfile.ZipFile(io.BytesIO(raw.translate(bytes(b ^ 0x55 for b in range(256)))))
     key = pw["data11"].encode("latin1")
     read = lambda n: z.read("../bin/Table/" + n, pwd=key)
-    optional = lambda n: read(n) if "../bin/Table/" + n in z.namelist() else None
     return (read("tb_Character_Info.res"), read("tb_Create_Cloth.res"), read("tb_Item.res"),
             read("tb_CashShop.res"), read("tb_CashBilling_Info.res"), read("tb_Item_Package.res"),
             read("tb_Item_Classify.res"), read("tb_NPC.res"), read("tb_Quest_Episode.res"),
             read("tb_Shop.res"), read("tb_Skill.res"),
-            optional("tb_Bank_Slot_Extend.res"))
+            read("tb_Bank_Slot_Extend.res"))
 
 
 def quest_bits(b):
@@ -149,9 +148,11 @@ def parse_classify(b):
 def parse_bank_slot_extend(b):
     """Decode tb_Bank_Slot_Extend's 20-byte rows and 34-byte table trailer."""
     if b is None:
-        return []
+        raise ValueError("required client table tb_Bank_Slot_Extend.res is missing")
     assert len(b) >= 4, "truncated tb_Bank_Slot_Extend header"
     n = struct.unpack_from("<I", b)[0]
+    if n == 0:
+        raise ValueError("tb_Bank_Slot_Extend.res contains no Add Slots expansion rows")
     row_size, trailer_size = 20, 34
     assert len(b) == 4 + n * row_size + trailer_size, (
         f"invalid tb_Bank_Slot_Extend size: {len(b)} for {n} rows"

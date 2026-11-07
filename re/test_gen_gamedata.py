@@ -26,6 +26,14 @@ class BankSlotExtendParserTest(unittest.TestCase):
         ]
         self.assertEqual(parse_bank_slot_extend(table), expected)
 
+    def test_missing_required_table_fails_clearly(self):
+        with self.assertRaisesRegex(ValueError, "required client table tb_Bank_Slot_Extend.res is missing"):
+            parse_bank_slot_extend(None)
+
+    def test_empty_table_fails_clearly(self):
+        with self.assertRaisesRegex(ValueError, "no Add Slots expansion rows"):
+            parse_bank_slot_extend(struct.pack("<I", 0) + bytes(34))
+
 
 if __name__ == "__main__":
     unittest.main()

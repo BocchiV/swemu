@@ -79,9 +79,12 @@ comes from server-side tables that the client does not ship. Point
 and `SW_TB_HEADERS` at the `TB_*.h` table headers. Without them the generator
 uses level-based fallbacks where it can.
 
-Missing server tables/headers leave their generated tables empty. Runtime defaults
-apply where implemented; without `tb_Drop*` tables monsters drop nothing, and
-without `Scripts/AI` scripted monster AI is unavailable.
+Optional server-only tables/headers may leave generated tables empty; runtime
+fallbacks apply where implemented. Without `tb_Drop*` tables monsters drop
+nothing, and without `Scripts/AI` scripted monster AI is unavailable. In
+contrast, `tb_Bank_Slot_Extend.res` comes from the client and is required for
+Add Slots generation; game-data generation fails clearly if it is missing or
+contains no expansion rows.
 
 ## Tests
 
