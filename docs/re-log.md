@@ -253,13 +253,14 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   `aux+2`, `aux+4`, and `aux+32` respectively to `FUN_1806d4800`, with the
   u16 capacity passed separately. The server therefore encodes
   `aux = capacity / 12 - base`, using bases 2/4/32 for groups 5/6/14:
-  Normal 24/36/48 -> 0/1/2, Costume 48/60 -> 0/1, Cash 384 -> 0. The former
-  Costume 48/2 pair made the client helper receive tier 6 rather than 4,
-  consistent with the reported 72-slot display. Actual row unlocking/rendering
-  still requires live-client verification.
+  Normal 24/36/48 -> 0/1/2, Costume 48/60 -> 0/1, Cash 384 -> 0.
+- The prior Costume48/aux2 encoding made the client handler receive tier 6
+  rather than tier 4, consistent with the reported 72-slot display. After the
+  fix, the user confirmed the client locks Costume slots 49–72 at capacity 48.
+  Other capacities and account states remain unverified.
 - E2E asserts packet bytes, bank-list aliases, account persistence, and
-  cross-character reload; actual UI rendering and row-unlock behavior remain
-  unverified.
+  cross-character reload; it remains protocol simulation and does not prove
+  rendered UI behavior.
 - Bank rows persist under `0x16/0x17/0x18`; move requests/replies use client
   aliases `0x10/0x11/0x12`; the `8/0x10` bank-info list uses those aliases for
   the visible `BankDialog` model. Ordinary bag groups remain unchanged.
@@ -287,8 +288,8 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   is not established.
   E2E checks both modes, one-card consumption, and a fresh-login second
   character observing the shared bank item serial, Zenny and capacities while
-  retaining a private wallet. Packet/UI metadata is checked; visual rendering
-  or row unlocking is not verified.
+  retaining a private wallet. These packet checks do not prove Add Slots UI
+  behavior; the Costume48 row-lock confirmation does not cover Add Slots.
 - Item-use C→S `8/0x11` retains item 6001026 for Normal storage, adding 12
   slots per use up to 48 (E2E covers 36→48).
 - Bank stack E2E uses a valid stackable potion in isolated bank storage, splits
