@@ -34,9 +34,10 @@ selectors 0x10 (Normal) and 0x11 (Costume), consuming one item 837000002 and
 adding 12 slots; replies echo the selector. Cash selector 0x12 is unsupported.
 Normal and Costume banks cap at 384; zero-valued Costume options above 384
 remain parsed but cannot be selected by the handler.
-After the UI auxiliary fix, the user reports that the actual client locks
-Costume slots 49–72 at capacity 48. This confirms the reported Costume48 case
-only; other capacities and account states remain unverified.
+After the UI auxiliary fix, the user confirmed that using the Add Slots prompt
+expands both Normal and Costume storage in the actual client. Separately, the
+user confirmed that Costume capacity 48 locks slots 49–72. Cash expansion is
+unsupported; exact visible post-expansion slot counts are not established.
 
 Bank Sort C→S `8/0x25` accepts selected UI groups 5/6/14 or bank aliases
 0x10/0x11/0x12, mapping to canonical DB groups 22/23/24 (0x16/0x17/0x18).

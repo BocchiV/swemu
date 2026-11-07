@@ -285,8 +285,9 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   bank items follow in `8/0x10`.
 - E2E exercises both raw selectors, card consumption, reply auxiliaries and
   capacities, and fresh-login bank persistence. It remains protocol simulation;
-  the user's Costume48 row-lock confirmation does not verify the Add Slots
-  prompt's actual-client effect.
+  separately, the user confirmed the actual-client Add Slots prompt expands
+  Normal and Costume storage. This does not establish exact visible slot counts
+  after use; Cash expansion remains unsupported.
 - Item-use C→S `8/0x11` retains item 6001026 for Normal storage, adding 12
   slots per use up to 48 (E2E covers 36→48).
 - Bank stack E2E uses a valid stackable potion in isolated bank storage, splits
