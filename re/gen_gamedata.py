@@ -218,32 +218,36 @@ def item_storage(items, classify, wanted=None):
 
 
 def parse_shop(b):
-    """tb_Shop (2.3.34.7, checked against the file: the whole table parses to
-    within the trailer): u32 index, u32 group, 7 bytes, u32 item, 6 bytes,
-    2 x wstr dates, u8 price type, u16 item count, 5 x u32 price, u8, u8, u32.
-    (Differs from the C++ TB_SHOP field order.) -> [(index, group, item,
-    price type, count, base price)]."""
-    n = struct.unpack_from("<I", b, 0)[0]
-    o, out = 4, []
-    for _ in range(n):
-        idx, grp = struct.unpack_from("<II", b, o)
-        item = struct.unpack_from("<I", b, o + 15)[0]
-        p = o + 25
+    """Parse tb_Shop (2.3.34.7) and verify that rows reach the trailer.
+
+    Layout: u32 index, u32 group, 7 bytes, u32 item, 6 bytes, two wstr dates,
+    u8 price type, u16 item count, five u32 prices, two u8s, and a u32.
+    This differs from the C++ TB_SHOP field order.
+    Returns (index, group, item, price type, count, base price) tuples.
+    """
+    row_count = struct.unpack_from("<I", b, 0)[0]
+    offset, rows = 4, []
+    for _ in range(row_count):
+        index, group = struct.unpack_from("<II", b, offset)
+        item_id = struct.unpack_from("<I", b, offset + 15)[0]
+        price_offset = offset + 25
         for _ in range(2):
-            ln = struct.unpack_from("<H", b, p)[0]
-            p += 2 + ln * 2
-        ptype, count = struct.unpack_from("<BH", b, p)
-        base = struct.unpack_from("<I", b, p + 3)[0]
-        out.append((idx, grp, item, ptype, count, base))
-        o = p + 29
-    assert len(b) - o < 64, f"tb_Shop layout drift: {len(b) - o} bytes left"
-    return out
+            date_length = struct.unpack_from("<H", b, price_offset)[0]
+            price_offset += 2 + date_length * 2
+        price_type, item_count = struct.unpack_from("<BH", b, price_offset)
+        base_price = struct.unpack_from("<I", b, price_offset + 3)[0]
+        rows.append((index, group, item_id, price_type, item_count, base_price))
+        offset = price_offset + 29
+    remaining = len(b) - offset
+    assert remaining < 64, f"tb_Shop layout drift: {remaining} bytes left"
+    return rows
 
 
 def parse_packages(b):
     """tb_Item_Package: fixed 156-byte rows (u32 count header, 34-byte table trailer)."""
     n = struct.unpack_from("<I", b, 0)[0]
-    assert 0 <= len(b) - 4 - 156 * n < 64, "tb_Item_Package layout drift"
+    trailer_size = len(b) - 4 - 156 * n
+    assert 0 <= trailer_size < 64, "tb_Item_Package layout drift"
     out = []
     for i in range(n):
         o = 4 + i * 156

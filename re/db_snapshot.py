@@ -17,18 +17,19 @@ TABLES = {
 
 c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 out = {}
-for t, cols in TABLES.items():
-    actual = {row[1] for row in c.execute(f'PRAGMA table_info("{t}")')}
-    if actual:
-        selected = [f'"{col}"' if col in actual else f'NULL AS "{col}"' for col in cols]
-        order = ", ".join(f'"{col}"' for col in cols[:2] if col in actual)
-        query = f"SELECT {', '.join(selected)} FROM \"{t}\""
-        if order:
-            query += f" ORDER BY {order}"
+for table_name, columns in TABLES.items():
+    actual_columns = {row[1] for row in c.execute(f'PRAGMA table_info("{table_name}")')}
+    if actual_columns:
+        selected_columns = [f'"{column}"' if column in actual_columns else f'NULL AS "{column}"'
+                            for column in columns]
+        order_by = ", ".join(f'"{column}"' for column in columns[:2] if column in actual_columns)
+        query = f"SELECT {', '.join(selected_columns)} FROM \"{table_name}\""
+        if order_by:
+            query += f" ORDER BY {order_by}"
         rows = c.execute(query).fetchall()
     else:
         rows = []
-    out[t] = (len(rows), hashlib.sha256(repr(rows).encode()).hexdigest()[:16])
+    out[table_name] = (len(rows), hashlib.sha256(repr(rows).encode()).hexdigest()[:16])
 if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'").fetchone():
     out["sqlite_sequence"] = sorted(c.execute("SELECT name, seq FROM sqlite_sequence").fetchall())
 else:

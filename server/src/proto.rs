@@ -3367,12 +3367,16 @@ mod tests {
     use tokio_util::codec::Decoder;
 
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&s[offset..offset + 2], 16).unwrap())
+            .collect()
     }
 
     fn wstr(s: &str) -> Vec<u8> {
-        let u: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        [(u.len() as u16).to_le_bytes().to_vec(), u].concat()
+        let mut writer = crate::codec::Writer::new();
+        writer.wstr(s);
+        writer.finish()
     }
 
     /// Payload bytes produced by the client's own writer (FUN_18000e430 x3 + u32).
