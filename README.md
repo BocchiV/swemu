@@ -21,6 +21,7 @@ reports and screenshots of swemu in action.
 | Login, server list, character create/delete/select, 2nd password (PIN) | basic version works, needs further development |
 | World entry, towns, NPCs, NPC shops, buy/sell/buyback, repair | basic version works, needs further development |
 | Inventory, equip, bag tools, item boxes, cash shop catalogue | basic version works, needs further development |
+| Personal storage | Bank items, Zenny, and capacities are shared account-wide across characters; initial capacities are Normal 24, Costume 48, Cash 384. Bank Sort 8/0x25 accepts selected UI groups 5/6/14 or aliases 0x10/0x11/0x12, maps them to canonical DB groups 22/23/24 (0x16/0x17/0x18), and echoes the requested group in its response. Bank stacks can be split/combined within one bank group. Item 6001026 expands Normal storage, and table-backed Add Slots 8/0x0F uses item 837000002 for Normal/Costume storage. Cash Add Slots remains unsupported |
 | Chat, gestures, GM commands (`/help`) | basic version works, needs further development |
 | Maze (dungeon) entry/exit, all mazes enterable, sectors, portals | basic version works, needs further development |
 | Level / EXP, drops and loot pickup | basic version works, needs further development |
@@ -78,6 +79,13 @@ comes from server-side tables that the client does not ship. Point
 and `SW_TB_HEADERS` at the `TB_*.h` table headers. Without them the generator
 uses level-based fallbacks where it can.
 
+Optional server-only tables/headers may leave generated tables empty; runtime
+fallbacks apply where implemented. Without `tb_Drop*` tables monsters drop
+nothing, and without `Scripts/AI` scripted monster AI is unavailable. In
+contrast, `tb_Bank_Slot_Extend.res` comes from the client and is required for
+Add Slots generation; game-data generation fails clearly if it is missing or
+contains no expansion rows.
+
 ## Tests
 
 ```
@@ -87,6 +95,12 @@ python re/e2e_client.py --host <ip> --port 15001 --aes --gm-user <gm account>
 
 `e2e_client.py` plays the whole flow (login to maze combat) with the client's own
 encryption and runs every server reply through the client's packet reader.
+
+For the account-storage E2E, add the test login to `gm_accounts` in
+`server/swemu.json` and use a fresh test database. The GM scenario checks
+account-shared bank items, Zenny, and capacities after a fresh login; bank
+aliases/sorting; stack split/combine; and Add Slots. This is protocol-level
+coverage, not proof of actual-client UI rendering.
 
 ## Layout
 

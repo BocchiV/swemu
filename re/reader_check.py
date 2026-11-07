@@ -78,6 +78,9 @@ READERS = {
     (9, 0x03): (0x18001faa0, 0x4000, "SHOP_REPURCHASER_LIST"),
     # ITEM_UPDATE_INVEN_MONEY (handler FUN_180dde8c0): FUN_180015c10 u64, u32, u8.
     (8, 0x20): (0x180015c10, 0x20, "ITEM_UPDATE_INVEN_MONEY"),
+    # ITEM_UPDATE_BANK_MONEY 8/0x21: handler FUN_180ddeff0 reads u64
+    # FUN_18000e5e0, calls bank UI's SetBankMoney method.
+    (8, 0x21): ([("cur", 0x18000e5e0)], 0x20, "ITEM_UPDATE_BANK_MONEY"),
     # SHOP_REPURCHASER reply (handler FUN_180e0a480): item list FUN_18001e840.
     (9, 0x04): (0x18001e840, 0x4000, "SHOP_REPURCHASER"),
     # ITEM_COMBINE reply (handler FUN_180df6930): FUN_18001f050.

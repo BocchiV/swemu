@@ -9,8 +9,18 @@ pub struct Db {
     conn: Connection,
 }
 
-/// Current schema layout (see `migrate_v2` and docs/database.md).
-pub const SCHEMA_VERSION: i64 = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BankZennyDirection {
+    Deposit,
+    Withdraw,
+}
+
+/// Current schema layout (see migrations and docs/database.md).
+pub const SCHEMA_VERSION: i64 = 6;
+
+const NORMAL_BANK_SLOTS: u16 = 24;
+const COSTUME_BANK_SLOTS: u16 = 48;
+const CASH_BANK_SLOTS: u16 = 384;
 
 /// v2 tables, in dependency order. Column order: identity, owner, content,
 /// progress, currencies, bookkeeping.
@@ -111,7 +121,7 @@ const COPY_V2: &[(&str, &str)] = &[
 /// one transaction; foreign keys are checked before commit.
 fn migrate_v2(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version >= SCHEMA_VERSION {
+    if version >= 2 {
         return Ok(());
     }
     // AUTOINCREMENT counters, so ids are never reused after the rebuild.
@@ -145,10 +155,213 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
     tx.execute("DELETE FROM sqlite_sequence WHERE name LIKE 'old_%'", [])?;
     let broken: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
     anyhow::ensure!(broken == 0, "schema v2 migration: {broken} foreign key violations");
-    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.execute_batch("PRAGMA user_version = 2;")?;
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    tracing::info!(version = SCHEMA_VERSION, "database schema migrated");
+    tracing::info!(version = 2, "database schema migrated");
+    Ok(())
+}
+
+fn migrate_v4(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 4 {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS storage_capacity (
+           character_id INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+           storage INTEGER NOT NULL CHECK (storage IN (5, 6, 14)),
+           slots INTEGER NOT NULL CHECK (slots >= 0),
+           PRIMARY KEY(character_id, storage)
+         ) WITHOUT ROWID;
+         INSERT OR IGNORE INTO storage_capacity(character_id, storage, slots) SELECT id, 5, 24 FROM character;
+         INSERT OR IGNORE INTO storage_capacity(character_id, storage, slots) SELECT id, 6, 48 FROM character;
+         INSERT OR IGNORE INTO storage_capacity(character_id, storage, slots) SELECT id, 14, 384 FROM character;
+         PRAGMA user_version=4;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 5 {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE character ADD COLUMN bank_zenny INTEGER NOT NULL DEFAULT 0 CHECK (bank_zenny >= 0);
+         UPDATE item SET storage=CASE storage WHEN 5 THEN 22 WHEN 6 THEN 23 WHEN 14 THEN 24 ELSE storage END
+           WHERE storage IN (5,6,14);
+         ALTER TABLE storage_capacity RENAME TO storage_capacity_v4;
+         CREATE TABLE storage_capacity (
+           character_id INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+           storage INTEGER NOT NULL CHECK (storage IN (22,23,24)),
+           slots INTEGER NOT NULL CHECK (slots >= 0),
+           PRIMARY KEY(character_id, storage)
+         ) WITHOUT ROWID;
+         INSERT INTO storage_capacity(character_id,storage,slots)
+           SELECT character_id, CASE storage WHEN 5 THEN 22 WHEN 6 THEN 23 WHEN 14 THEN 24 END, slots FROM storage_capacity_v4;
+         DROP TABLE storage_capacity_v4;
+         PRAGMA user_version=5;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_v6(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 6 {
+        return Ok(());
+    }
+    let item_seq: Option<i64> = conn.query_row(
+        "SELECT seq FROM sqlite_sequence WHERE name='item'",
+        [],
+        |row| row.get(0),
+    ).optional()?;
+    let tx = conn.unchecked_transaction()?;
+    let violations: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+    anyhow::ensure!(violations == 0, "schema v6 migration: {violations} legacy foreign key violations");
+    let bank_slots_overflow: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM item i JOIN character c ON c.id=i.character_id
+             WHERE i.storage IN (22,23,24) AND i.slot >= 32767
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        !bank_slots_overflow,
+        "schema v6 migration: legacy bank slot capacity exceeds client i16"
+    );
+    let bank_item_count_overflow: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM item i JOIN character c ON c.id=i.character_id
+             WHERE i.storage IN (22,23,24)
+             GROUP BY c.account_id,i.storage HAVING COUNT(*) > 32767
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        !bank_item_count_overflow,
+        "schema v6 migration: legacy bank storage exceeds client i16 slot capacity"
+    );
+    let mut bank_balances = std::collections::HashMap::<u32, u128>::new();
+    {
+        let mut statement = tx.prepare("SELECT account_id,bank_zenny FROM character ORDER BY id")?;
+        for row in statement.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, i64>(1)?)))? {
+            let (account, balance) = row?;
+            let total = bank_balances.entry(account).or_default();
+            *total = total.checked_add(balance.max(0) as u128)
+                .ok_or_else(|| anyhow::anyhow!("legacy bank balance overflow"))?;
+            anyhow::ensure!(*total <= u64::MAX as u128, "schema v6 migration: legacy bank Zenny exceeds client u64 range");
+        }
+    }
+    let capacity_overflow: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM storage_capacity WHERE slots < 0 OR slots > 32767)",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(!capacity_overflow, "schema v6 migration: legacy bank capacity exceeds client i16");
+    let count_overflow: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM item WHERE storage IN (22,23,24) AND (count < 1 OR count > 65535))",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(!count_overflow, "schema v6 migration: legacy bank item count exceeds u16");
+    tx.execute_batch(
+        "CREATE TABLE item_v6 (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           character_id INTEGER REFERENCES character(id) ON DELETE CASCADE,
+           account_id INTEGER REFERENCES account(id) ON DELETE CASCADE,
+           storage INTEGER NOT NULL CHECK(storage BETWEEN 0 AND 255),
+           slot INTEGER NOT NULL CHECK(slot >= 0),
+           item_id INTEGER NOT NULL,
+           count INTEGER NOT NULL DEFAULT 1 CHECK(count >= 1),
+           created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+           CHECK ((character_id IS NOT NULL AND account_id IS NULL AND storage NOT IN (22,23,24)) OR
+                  (character_id IS NULL AND account_id IS NOT NULL AND storage IN (22,23,24)))
+         );
+         CREATE TABLE storage_capacity_v6 (
+           account_id INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+           storage INTEGER NOT NULL CHECK(storage IN (22,23,24)),
+           slots INTEGER NOT NULL CHECK(slots BETWEEN 0 AND 32767),
+           PRIMARY KEY(account_id,storage)
+         ) WITHOUT ROWID;
+         CREATE TABLE bank_zenny (
+           account_id INTEGER PRIMARY KEY REFERENCES account(id) ON DELETE CASCADE,
+           balance TEXT NOT NULL CHECK(balance NOT GLOB '*[^0-9]*' AND length(balance)>0)
+         );
+         INSERT INTO item_v6(id,character_id,storage,slot,item_id,count,created_at)
+           SELECT id,character_id,storage,slot,item_id,count,created_at FROM item WHERE storage NOT IN (22,23,24);
+         WITH RECURSIVE slot_numbers(n) AS (
+           SELECT 0 UNION ALL SELECT n+1 FROM slot_numbers WHERE n < 65535
+         ), bank_rows AS (
+           SELECT i.id,c.account_id,i.storage,i.slot,i.item_id,i.count,i.created_at,c.id AS character_order,
+                  ROW_NUMBER() OVER(PARTITION BY c.account_id,i.storage,i.slot ORDER BY c.id,i.id) AS duplicate_rank
+           FROM item i JOIN character c ON c.id=i.character_id WHERE i.storage IN (22,23,24)
+         ), duplicates AS (
+           SELECT id,account_id,storage,
+                  ROW_NUMBER() OVER(PARTITION BY account_id,storage ORDER BY character_order,id) AS relocation_rank
+           FROM bank_rows WHERE duplicate_rank > 1
+         ), free_slots AS (
+           SELECT groups.account_id,groups.storage,slot_numbers.n,
+                  ROW_NUMBER() OVER(PARTITION BY groups.account_id,groups.storage ORDER BY slot_numbers.n) AS free_rank
+           FROM (SELECT DISTINCT account_id,storage FROM bank_rows) groups CROSS JOIN slot_numbers
+           WHERE NOT EXISTS (
+             SELECT 1 FROM bank_rows b WHERE b.account_id=groups.account_id
+               AND b.storage=groups.storage AND b.slot=slot_numbers.n
+           )
+         )
+         INSERT INTO item_v6(id,account_id,storage,slot,item_id,count,created_at)
+           SELECT b.id,b.account_id,b.storage,COALESCE(f.n,b.slot),b.item_id,b.count,b.created_at
+           FROM bank_rows b LEFT JOIN duplicates d ON d.id=b.id
+           LEFT JOIN free_slots f ON f.account_id=d.account_id AND f.storage=d.storage AND f.free_rank=d.relocation_rank
+           WHERE b.duplicate_rank=1 OR f.n IS NOT NULL;
+         INSERT INTO storage_capacity_v6(account_id,storage,slots)
+           SELECT c.account_id, sc.storage, MAX(sc.slots) FROM storage_capacity sc
+           JOIN character c ON c.id=sc.character_id GROUP BY c.account_id,sc.storage;
+         INSERT OR IGNORE INTO storage_capacity_v6(account_id,storage,slots)
+           SELECT a.id, 22, 24 FROM account a;
+         INSERT OR IGNORE INTO storage_capacity_v6(account_id,storage,slots)
+           SELECT a.id, 23, 48 FROM account a;
+         INSERT OR IGNORE INTO storage_capacity_v6(account_id,storage,slots)
+           SELECT a.id, 24, 384 FROM account a;
+         UPDATE storage_capacity_v6 SET slots=MAX(slots,(
+           SELECT COALESCE(MAX(i.slot)+1,0) FROM item_v6 i
+           WHERE i.account_id=storage_capacity_v6.account_id AND i.storage=storage_capacity_v6.storage
+         ));
+         DROP TABLE item;
+         ALTER TABLE item_v6 RENAME TO item;
+         CREATE UNIQUE INDEX item_character_slot ON item(character_id,storage,slot) WHERE character_id IS NOT NULL;
+         CREATE UNIQUE INDEX item_account_slot ON item(account_id,storage,slot) WHERE account_id IS NOT NULL;
+         CREATE INDEX item_character ON item(character_id);
+         CREATE INDEX item_account ON item(account_id);
+         DROP TABLE storage_capacity;
+         ALTER TABLE storage_capacity_v6 RENAME TO storage_capacity;
+         ALTER TABLE character DROP COLUMN bank_zenny;
+         PRAGMA user_version=6;",
+    )?;
+    for (account, balance) in bank_balances {
+        if balance != 0 {
+            tx.execute(
+                "INSERT INTO bank_zenny(account_id,balance) VALUES (?1,?2)",
+                params![account, balance.to_string()],
+            )?;
+        }
+    }
+    let broken: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+    anyhow::ensure!(broken == 0, "schema v6 migration: {broken} foreign key violations");
+    let old_seq = item_seq.unwrap_or(0);
+    tx.execute("UPDATE sqlite_sequence SET seq=MAX(seq,?1) WHERE name='item'", [old_seq])?;
+    tx.execute(
+        "INSERT INTO sqlite_sequence(name,seq) SELECT 'item',?1 WHERE ?1>0
+         AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='item')",
+        [old_seq],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -311,6 +524,9 @@ impl Db {
             }
         }
         migrate_v2(&conn)?;
+        migrate_v4(&conn)?;
+        migrate_v5(&conn)?;
+        migrate_v6(&conn)?;
         // Start account ids at 1000 like the reconstructed server's test account.
         conn.execute(
             "INSERT INTO sqlite_sequence(name, seq) SELECT 'account', 999
@@ -324,6 +540,77 @@ impl Db {
     /// Schema version (PRAGMA user_version).
     pub fn schema_version(&self) -> Result<i64> {
         Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    /// Account-wide bank capacity, initialized to the protocol's base size.
+    pub fn storage_capacity(&self, account: u32, storage: u8) -> Result<u16> {
+        let default = match storage {
+            22 => NORMAL_BANK_SLOTS,
+            23 => COSTUME_BANK_SLOTS,
+            24 => CASH_BANK_SLOTS,
+            _ => return Ok(0),
+        };
+        self.conn.execute(
+            "INSERT OR IGNORE INTO storage_capacity(account_id,storage,slots) VALUES (?1,?2,?3)",
+            params![account, storage, default],
+        )?;
+        let slots: i64 = self.conn.query_row(
+            "SELECT slots FROM storage_capacity WHERE account_id=?1 AND storage=?2",
+            params![account, storage],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!((0..=i16::MAX as i64).contains(&slots), "bank capacity exceeds client i16 range");
+        Ok(slots as u16)
+    }
+
+    pub fn consume_storage_expansion(
+        &self, account: u32, character: u32, source_storage: u8, target_storage: u8,
+        selected: Option<(u64, u16)>, required_item_id: u32, required_count: u16, target_capacity: u16,
+    ) -> Result<Option<(ItemRecord, u16)>> {
+        let (base, maximum) = match target_storage {
+            22 => (NORMAL_BANK_SLOTS, 384),
+            23 => (COSTUME_BANK_SLOTS, 384),
+            _ => return Ok(None),
+        };
+        if required_count == 0 || target_capacity <= base || target_capacity > maximum { return Ok(None); }
+        let tx = self.conn.unchecked_transaction()?;
+        if !tx.prepare("SELECT 1 FROM character WHERE id=?1 AND account_id=?2")?
+            .exists(params![character, account])? { return Ok(None); }
+        let row = tx.query_row(
+            "SELECT id,slot,count FROM item WHERE character_id=?1 AND storage=?2 AND item_id=?3 AND count>=?4
+             AND (?5 IS NULL OR id=?5) AND (?6 IS NULL OR slot=?6) ORDER BY slot LIMIT 1",
+            params![character, source_storage, required_item_id, required_count,
+                selected.map(|(serial, _)| serial as i64), selected.map(|(_, slot)| slot)],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, u16>(1)?, r.get::<_, u16>(2)?)),
+        ).optional()?;
+        let Some((serial, slot, count)) = row else { return Ok(None) };
+        let current = tx.query_row(
+            "SELECT slots FROM storage_capacity WHERE account_id=?1 AND storage=?2",
+            params![account, target_storage], |r| r.get::<_, u16>(0),
+        ).optional()?.unwrap_or(base);
+        if target_capacity <= current { return Ok(None); }
+        let left = count - required_count;
+        if left == 0 {
+            tx.execute("DELETE FROM item WHERE id=?1 AND character_id=?2", params![serial as i64, character])?;
+        } else {
+            tx.execute("UPDATE item SET count=?1 WHERE id=?2 AND character_id=?3", params![left, serial as i64, character])?;
+        }
+        tx.execute(
+            "INSERT INTO storage_capacity(account_id,storage,slots) VALUES (?1,?2,?3)
+             ON CONFLICT(account_id,storage) DO UPDATE SET slots=excluded.slots",
+            params![account, target_storage, target_capacity],
+        )?;
+        tx.commit()?;
+        Ok(Some((ItemRecord { serial, storage: source_storage, slot, item_id: required_item_id, count: left }, target_capacity)))
+    }
+
+    pub(crate) fn bank_zenny_balance(&self, account: u32) -> Result<u128> {
+        let balance: Option<String> = self.conn.query_row(
+            "SELECT balance FROM bank_zenny WHERE account_id=?1",
+            params![account],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(balance.unwrap_or_else(|| "0".to_owned()).parse()?)
     }
 
     /// Single-player convenience used by the launcher-token path: any name is auto-registered.
@@ -550,6 +837,7 @@ impl Db {
     /// the attempt (src, dest); unchanged when refused.
     pub fn move_item(
         &self,
+        account: u32,
         character: u32,
         src: (u8, u16),
         dest: (u8, u16),
@@ -557,39 +845,166 @@ impl Db {
         keep_filled: &[(u8, u16)],
     ) -> Result<(Option<ItemRecord>, Option<ItemRecord>, bool)> {
         let tx = self.conn.unchecked_transaction()?;
-        let at = |(st, sl): (u8, u16)| -> Result<Option<ItemRecord>> {
-            Ok(tx
-                .query_row(
-                    "SELECT id, item_id, count FROM item WHERE character_id=?1 AND storage=?2 AND slot=?3",
-                    params![character, st, sl],
-                    |r| Ok(ItemRecord { serial: r.get::<_, i64>(0)? as u64, storage: st, slot: sl, item_id: r.get(1)?, count: r.get(2)? }),
-                )
-                .optional()?)
+        if !tx.prepare("SELECT 1 FROM character WHERE id=?1 AND account_id=?2")?
+            .exists(params![character, account])?
+        {
+            return Ok((None, None, false));
+        }
+        let at = |(storage, slot): (u8, u16)| -> Result<Option<ItemRecord>> {
+            let bank = (22..=24).contains(&storage);
+            Ok(tx.query_row(
+                "SELECT id,item_id,count FROM item WHERE storage=?1 AND slot=?2 AND
+                 ((?3=1 AND account_id=?4 AND character_id IS NULL) OR
+                  (?3=0 AND character_id=?5 AND account_id IS NULL))",
+                params![storage, slot, bank, account, character],
+                |row| Ok(ItemRecord {
+                    serial: row.get::<_, i64>(0)? as u64,
+                    storage,
+                    slot,
+                    item_id: row.get(1)?,
+                    count: row.get(2)?,
+                }),
+            ).optional()?)
         };
         let (a, b) = (at(src)?, at(dest)?);
-        // A slot in `keep_filled` may only swap, never be left empty.
-        let empties_kept = (keep_filled.contains(&src) && b.is_none()) || (keep_filled.contains(&dest) && a.is_none());
-        let ok = src != dest
-            && !empties_kept
-            && a.is_some()
-            && a.map_or(true, |i| allowed(i.item_id, dest.0, dest.1))
-            && b.map_or(true, |i| allowed(i.item_id, src.0, src.1));
+        let empties_kept =
+            (keep_filled.contains(&src) && b.is_none()) || (keep_filled.contains(&dest) && a.is_none());
+        let ok = src != dest && !empties_kept && a.is_some()
+            && a.map_or(true, |item| allowed(item.item_id, dest.0, dest.1))
+            && b.map_or(true, |item| allowed(item.item_id, src.0, src.1));
         if !ok {
             return Ok((a, b, false));
         }
-        // Park src on a slot no real item uses, then swap (UNIQUE(storage, slot)).
-        let park = |serial: u64, (st, sl): (u8, u16)| {
-            tx.execute("UPDATE item SET storage=?1, slot=?2 WHERE id=?3", params![st, sl, serial as i64])
+        let owner = |storage: u8| -> (Option<u32>, Option<u32>) {
+            if (22..=24).contains(&storage) { (None, Some(account)) } else { (Some(character), None) }
+        };
+        let park = |serial: u64, storage: u8, slot: i64| -> Result<()> {
+            let (character_id, account_id) = owner(storage);
+            tx.execute(
+                "UPDATE item SET character_id=?1,account_id=?2,storage=?3,slot=?4 WHERE id=?5",
+                params![character_id, account_id, storage, slot, serial as i64],
+            )?;
+            Ok(())
         };
         let a = a.unwrap();
-        park(a.serial, (255, u16::MAX))?;
-        if let Some(b) = b {
-            park(b.serial, src)?;
+        park(a.serial, src.0, i64::MAX)?;
+        if let Some(item) = b {
+            park(item.serial, src.0, src.1 as i64)?;
         }
-        park(a.serial, dest)?;
+        park(a.serial, dest.0, dest.1 as i64)?;
         tx.commit()?;
-        let moved_b = b.map(|b| ItemRecord { storage: src.0, slot: src.1, ..b });
+        let moved_b = b.map(|item| ItemRecord { storage: src.0, slot: src.1, ..item });
         Ok((moved_b, Some(ItemRecord { storage: dest.0, slot: dest.1, ..a }), true))
+    }
+
+    pub fn bank_items(&self, account: u32) -> Result<Vec<ItemRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,storage,slot,item_id,count FROM item
+             WHERE account_id=?1 AND character_id IS NULL ORDER BY storage,slot",
+        )?;
+        let rows = statement.query_map(params![account], |row| Ok(ItemRecord {
+            serial: row.get::<_, i64>(0)? as u64,
+            storage: row.get(1)?,
+            slot: row.get(2)?,
+            item_id: row.get(3)?,
+            count: row.get(4)?,
+        }))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn bank_item_at(&self, account: u32, storage: u8, slot: u16) -> Result<Option<ItemRecord>> {
+        Ok(self.conn.query_row(
+            "SELECT id,item_id,count FROM item WHERE account_id=?1 AND character_id IS NULL AND storage=?2 AND slot=?3",
+            params![account, storage, slot],
+            |row| Ok(ItemRecord {
+                serial: row.get::<_, i64>(0)? as u64,
+                storage,
+                slot,
+                item_id: row.get(1)?,
+                count: row.get(2)?,
+            }),
+        ).optional()?)
+    }
+
+    pub fn divide_bank_item(
+        &self, account: u32, storage: u8, src_slot: u16, dest_slot: u16, count: u16,
+        allowed: impl Fn(u32, u8, u16) -> bool,
+    ) -> Result<Option<(ItemRecord, ItemRecord)>> {
+        if !(22..=24).contains(&storage) { return Ok(None); }
+        let capacity = self.storage_capacity(account, storage)?;
+        if src_slot >= capacity || dest_slot >= capacity || src_slot == dest_slot { return Ok(None); }
+        let Some(src) = self.bank_item_at(account, storage, src_slot)? else { return Ok(None) };
+        if count == 0 || count >= src.count || self.bank_item_at(account, storage, dest_slot)?.is_some()
+            || !allowed(src.item_id, storage, dest_slot) { return Ok(None); }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE item SET count=?1 WHERE id=?2 AND account_id=?3 AND character_id IS NULL",
+            params![src.count - count, src.serial as i64, account])?;
+        tx.execute("INSERT INTO item(character_id,account_id,storage,slot,item_id,count) VALUES(NULL,?1,?2,?3,?4,?5)",
+            params![account, storage, dest_slot, src.item_id, count])?;
+        let added = ItemRecord { serial: tx.last_insert_rowid() as u64, storage, slot: dest_slot, item_id: src.item_id, count };
+        tx.commit()?;
+        Ok(Some((ItemRecord { count: src.count - count, ..src }, added)))
+    }
+
+    pub fn combine_bank_items(
+        &self, account: u32, storage: u8, src_slot: u16, dest_slot: u16, count: u16, stack: u16,
+    ) -> Result<Option<(ItemRecord, ItemRecord)>> {
+        if !(22..=24).contains(&storage) || src_slot == dest_slot { return Ok(None); }
+        let capacity = self.storage_capacity(account, storage)?;
+        if src_slot >= capacity || dest_slot >= capacity { return Ok(None); }
+        let (Some(src), Some(dest)) = (
+            self.bank_item_at(account, storage, src_slot)?, self.bank_item_at(account, storage, dest_slot)?,
+        ) else { return Ok(None) };
+        let moved = (if count == 0 { src.count } else { count.min(src.count) })
+            .min(stack.saturating_sub(dest.count));
+        if src.item_id != dest.item_id || moved == 0 { return Ok(None); }
+        let tx = self.conn.unchecked_transaction()?;
+        if moved == src.count {
+            tx.execute("DELETE FROM item WHERE id=?1 AND account_id=?2 AND character_id IS NULL", params![src.serial as i64, account])?;
+        } else {
+            tx.execute("UPDATE item SET count=?1 WHERE id=?2 AND account_id=?3 AND character_id IS NULL",
+                params![src.count - moved, src.serial as i64, account])?;
+        }
+        tx.execute("UPDATE item SET count=?1 WHERE id=?2 AND account_id=?3 AND character_id IS NULL",
+            params![dest.count + moved, dest.serial as i64, account])?;
+        tx.commit()?;
+        Ok(Some((ItemRecord { count: src.count - moved, ..src }, ItemRecord { count: dest.count + moved, ..dest })))
+    }
+
+    pub fn line_up_bank(&self, account: u32, storage: u8) -> Result<Vec<ItemRecord>> {
+        if !(22..=24).contains(&storage) { anyhow::bail!("invalid bank storage {storage}"); }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut items = {
+            let mut statement = tx.prepare(
+                "SELECT id,storage,slot,item_id,count FROM item
+                 WHERE account_id=?1 AND character_id IS NULL AND storage=?2 ORDER BY item_id,id",
+            )?;
+            let rows = statement.query_map(params![account, storage], |row| Ok(ItemRecord {
+                serial: row.get::<_, i64>(0)? as u64, storage: row.get(1)?, slot: row.get(2)?,
+                item_id: row.get(3)?, count: row.get(4)?,
+            }))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let max_slot: Option<i64> = tx.query_row(
+            "SELECT MAX(slot) FROM item WHERE account_id=?1 AND character_id IS NULL AND storage=?2",
+            params![account, storage], |row| row.get(0),
+        )?;
+        let mut temporary = max_slot.unwrap_or(-1).checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("bank slot range exhausted"))?;
+        for (index, item) in items.iter().enumerate() {
+            tx.execute("UPDATE item SET slot=?1 WHERE id=?2 AND account_id=?3 AND character_id IS NULL AND storage=?4",
+                params![temporary, item.serial as i64, account, storage])?;
+            if index + 1 < items.len() {
+                temporary = temporary.checked_add(1).ok_or_else(|| anyhow::anyhow!("bank slot range exhausted"))?;
+            }
+        }
+        for (slot, item) in items.iter_mut().enumerate() {
+            item.slot = slot as u16;
+            tx.execute("UPDATE item SET slot=?1 WHERE id=?2 AND account_id=?3 AND character_id IS NULL AND storage=?4",
+                params![item.slot, item.serial as i64, account, storage])?;
+        }
+        tx.commit()?;
+        Ok(items)
     }
 
     /// Items of a character, ordered by storage and slot.
@@ -643,6 +1058,42 @@ impl Db {
                 Ok(start)
             }
         }
+    }
+
+    pub fn transfer_bank_zenny(
+        &self, account: u32, character: u32, direction: BankZennyDirection, amount: u64, start_wallet: u64,
+    ) -> Result<Option<(u64, u128)>> {
+        if amount == 0 || start_wallet > i64::MAX as u64 { return Ok(None); }
+        let tx = self.conn.unchecked_transaction()?;
+        let balances: Option<(Option<i64>, Option<String>)> = tx.query_row(
+            "SELECT c.zenny,b.balance FROM character c LEFT JOIN bank_zenny b ON b.account_id=c.account_id
+             WHERE c.id=?1 AND c.account_id=?2",
+            params![character, account], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        let Some((wallet, bank)) = balances else { return Ok(None) };
+        let wallet = wallet.unwrap_or(start_wallet as i64).max(0) as u64;
+        let bank = bank.as_deref().unwrap_or("0").parse::<u128>()?;
+        let (new_wallet, new_bank) = match direction {
+            BankZennyDirection::Deposit if wallet >= amount => {
+                let Some(next) = bank.checked_add(amount as u128) else { return Ok(None) };
+                if next > u64::MAX as u128 { return Ok(None); }
+                (wallet - amount, next)
+            }
+            BankZennyDirection::Withdraw if bank >= amount as u128 => {
+                let Some(next) = wallet.checked_add(amount) else { return Ok(None) };
+                if next > i64::MAX as u64 { return Ok(None); }
+                (next, bank - amount as u128)
+            }
+            _ => return Ok(None),
+        };
+        tx.execute("UPDATE character SET zenny=?1 WHERE id=?2", params![new_wallet as i64, character])?;
+        tx.execute(
+            "INSERT INTO bank_zenny(account_id,balance) VALUES (?1,?2)
+             ON CONFLICT(account_id) DO UPDATE SET balance=excluded.balance",
+            params![account, new_bank.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(Some((new_wallet, new_bank)))
     }
 
     /// Set a character's level (GM command); EXP into the level starts at 0.
@@ -1123,6 +1574,68 @@ fn hash_password(password: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bank_divide_combine_is_scoped_and_bounded() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("bank-stack").unwrap();
+        let other = db.login_or_register("bank-stack-other").unwrap();
+        for (owner, storage, slot, item, count) in [
+            (account, 22, 0, 500, 12), (account, 22, 1, 501, 5),
+            (account, 23, 0, 500, 7), (other, 23, 0, 500, 9),
+        ] {
+            db.conn.execute(
+                "INSERT INTO item(character_id,account_id,storage,slot,item_id,count) VALUES(NULL,?1,?2,?3,?4,?5)",
+                params![owner, storage, slot, item, count],
+            ).unwrap();
+        }
+        let other_before = db.bank_items(other).unwrap();
+        let nc = NewCharacter { name: "BankStackBag", class: 1, appearance: [0; 4], class_ref: 0, outfit: 0 };
+        let CreateOutcome::Created { id: character, .. } = db.create_character(account, &nc, 0, 4).unwrap() else { panic!() };
+        let bag_before = db.add_items(character, 2, 4, &[(500, 3)]).unwrap().unwrap();
+        let any = |_: u32, _: u8, _: u16| true;
+        let (source, divided) = db.divide_bank_item(account, 22, 0, 2, 4, any).unwrap().unwrap();
+        assert_eq!((source.storage, source.count, divided.count), (22, 8, 4));
+        assert_ne!(source.serial, divided.serial);
+        assert!(db.divide_bank_item(account, 22, 0, 24, 1, any).unwrap().is_none());
+        assert!(db.divide_bank_item(account, 22, 0, 3, 1, |_, _, _| false).unwrap().is_none());
+        assert!(db.divide_bank_item(other, 22, 0, 2, 1, any).unwrap().is_none());
+        let (source_partial, dest_partial) = db.combine_bank_items(account, 22, 2, 0, 0, 10).unwrap().unwrap();
+        assert_eq!((source_partial.count, dest_partial.count), (2, 10));
+        let (source_after, dest_after) = db.combine_bank_items(account, 22, 2, 0, 0, 50).unwrap().unwrap();
+        assert_eq!((source_after.count, dest_after.count), (0, 12));
+        assert!(db.bank_items(account).unwrap().iter().all(|i| !(i.storage == 22 && i.slot == 2)));
+        assert!(db.combine_bank_items(account, 22, 1, 0, 0, 50).unwrap().is_none());
+        assert!(db.combine_bank_items(account, 22, 0, 24, 1, 50).unwrap().is_none());
+        assert_eq!(db.bank_items(other).unwrap(), other_before);
+        assert_eq!(db.items(character).unwrap(), bag_before);
+    }
+
+    #[test]
+    fn line_up_bank_packs_only_selected_account_storage() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("bank-sort").unwrap();
+        let other = db.login_or_register("bank-sort-other").unwrap();
+        for (owner, storage, slot, item) in [
+            (account, 22, 3, 300), (account, 22, 8, 100),
+            (account, 23, 5, 50), (other, 22, 2, 25),
+        ] {
+            db.conn.execute(
+                "INSERT INTO item(character_id,account_id,storage,slot,item_id,count) VALUES(NULL,?1,?2,?3,?4,1)",
+                params![owner, storage, slot, item],
+            ).unwrap();
+        }
+        let other_before = db.bank_items(other).unwrap();
+        let lined = db.line_up_bank(account, 22).unwrap();
+        assert_eq!(lined.iter().map(|i| (i.storage, i.slot, i.item_id)).collect::<Vec<_>>(),
+            vec![(22, 0, 100), (22, 1, 300)]);
+        let bank = db.bank_items(account).unwrap();
+        assert_eq!(bank.iter().filter(|i| i.storage == 22).map(|i| (i.slot, i.item_id)).collect::<Vec<_>>(),
+            vec![(0, 100), (1, 300)]);
+        assert_eq!(bank.iter().filter(|i| i.storage == 23).map(|i| (i.slot, i.item_id)).collect::<Vec<_>>(),
+            vec![(5, 50)]);
+        assert_eq!(db.bank_items(other).unwrap(), other_before);
+    }
     #[test]
     fn autoregister_is_stable() {
         let db = Db::open(":memory:").unwrap();
@@ -1315,17 +1828,17 @@ mod tests {
             (_, 4) => sl < 48,
             _ => false,
         };
-        let (_, _, ok) = db.move_item(id, (4, costume.slot), (0, 3), fits, &[]).unwrap();
+        let (_, _, ok) = db.move_item(a, id, (4, costume.slot), (0, 3), fits, &[]).unwrap();
         assert!(!ok, "wrong equip slot is refused");
-        let (src, dest, ok) = db.move_item(id, (4, costume.slot), (0, 7), fits, &[]).unwrap();
+        let (src, dest, ok) = db.move_item(a, id, (4, costume.slot), (0, 7), fits, &[]).unwrap();
         assert!(ok && src.is_none() && dest.unwrap().item_id == 213881001);
         // unequip the starter body onto an empty bag slot
-        let (src, dest, ok) = db.move_item(id, (0, 6), (4, 5), fits, &[]).unwrap();
+        let (src, dest, ok) = db.move_item(a, id, (0, 6), (4, 5), fits, &[]).unwrap();
         assert!(ok && src.is_none() && dest.unwrap().item_id == 211010701);
         let worn: Vec<_> = db.items(id).unwrap().into_iter().filter(|i| i.storage == 0).map(|i| (i.slot, i.item_id)).collect();
         assert_eq!(worn, vec![(7, 213881001)]);
         // swap: bag item onto an occupied equip slot puts the worn one in the bag
-        let (src, dest, ok) = db.move_item(id, (0, 7), (4, 5), fits, &[]).unwrap();
+        let (src, dest, ok) = db.move_item(a, id, (0, 7), (4, 5), fits, &[]).unwrap();
         assert!(!ok, "211010701 cannot go to shape slot 7");
         assert_eq!((src.unwrap().item_id, dest.unwrap().item_id), (213881001, 211010701));
         // soul weapon: seeded once, swapped with a bag weapon, never emptied
@@ -1334,9 +1847,9 @@ mod tests {
         let bought = db.add_items(id, 2, 24, &[(111011302, 1)]).unwrap().unwrap()[0];
         let wfits = |item: u32, st: u8, sl: u16| (item / 1000 == 111011 && ((st == 1 && sl == 0) || (st == 2 && sl < 24)));
         let keep = [(1u8, 0u16)];
-        let (src, dest, ok) = db.move_item(id, (1, 0), (2, 10), wfits, &keep).unwrap();
+        let (src, dest, ok) = db.move_item(a, id, (1, 0), (2, 10), wfits, &keep).unwrap();
         assert!(!ok && src.unwrap().item_id == 111011301 && dest.is_none(), "weapon slot is never emptied");
-        let (src, dest, ok) = db.move_item(id, (2, bought.slot), (1, 0), wfits, &keep).unwrap();
+        let (src, dest, ok) = db.move_item(a, id, (2, bought.slot), (1, 0), wfits, &keep).unwrap();
         assert!(ok && src.unwrap().item_id == 111011301 && dest.unwrap().item_id == 111011302, "equip swaps");
     }
 
@@ -1375,6 +1888,179 @@ mod tests {
         assert!(matches!(db.login_with_password("old", "pw", false).unwrap(), LoginOutcome::Ok(_)));
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bank_zenny_deposit_over_u64_preserves_both_balances() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("bank-u64").unwrap();
+        let request = NewCharacter { name: "Wallet", class: 1, appearance: [0; 4], class_ref: 0, outfit: 0 };
+        let CreateOutcome::Created { id: character, .. } = db.create_character(account, &request, 0, 4).unwrap() else { panic!() };
+        db.set_zenny(character, 100).unwrap();
+        let initial_bank = u64::MAX - 5;
+        db.conn.execute("INSERT INTO bank_zenny(account_id,balance) VALUES (?1,?2)", params![account, initial_bank.to_string()]).unwrap();
+        assert_eq!(
+            db.transfer_bank_zenny(account, character, BankZennyDirection::Deposit, 10, 0).unwrap(),
+            None
+        );
+        assert_eq!(db.zenny(character, 0).unwrap(), 100);
+        assert_eq!(db.bank_zenny_balance(account).unwrap(), initial_bank as u128);
+    }
+
+    #[test]
+    fn v6_migration_handles_missing_capacity_and_rejects_unrepresentable_slots() {
+        let legacy_db = || {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE account(id INTEGER PRIMARY KEY);
+                 CREATE TABLE character(id INTEGER PRIMARY KEY, account_id INTEGER, bank_zenny INTEGER);
+                 CREATE TABLE item(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, character_id INTEGER, storage INTEGER,
+                    slot INTEGER, item_id INTEGER, count INTEGER, created_at INTEGER,
+                    UNIQUE(character_id, storage, slot)
+                 );
+                 CREATE TABLE storage_capacity(character_id INTEGER, storage INTEGER, slots INTEGER);
+                 INSERT INTO account VALUES (1);
+                 INSERT INTO character VALUES (1, 1, 0), (2, 1, 0);
+                 PRAGMA user_version=5;",
+            )
+            .unwrap();
+            conn
+        };
+
+        let out_of_range = legacy_db();
+        out_of_range
+            .execute(
+                "INSERT INTO item(character_id,storage,slot,item_id,count,created_at)
+                 VALUES (1,22,65535,1,1,0)",
+                [],
+            )
+            .unwrap();
+        assert!(migrate_v6(&out_of_range).is_err());
+        assert_eq!(out_of_range.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(out_of_range.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+
+        let full = legacy_db();
+        let tx = full.unchecked_transaction().unwrap();
+        {
+            let mut insert = tx
+                .prepare("INSERT INTO item(character_id,storage,slot,item_id,count,created_at) VALUES (1,22,?1,1,1,0)")
+                .unwrap();
+            for slot in 0..32767 {
+                insert.execute(params![slot]).unwrap();
+            }
+        }
+        tx.execute(
+            "INSERT INTO item(character_id,storage,slot,item_id,count,created_at) VALUES (2,22,0,1,1,0)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(migrate_v6(&full).is_err());
+        assert_eq!(full.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), 32_768);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item WHERE slot=0", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item WHERE character_id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 32_767);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item WHERE character_id=2 AND slot=0", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let sparse = legacy_db();
+        sparse
+            .execute(
+                "INSERT INTO item(character_id,storage,slot,item_id,count,created_at)
+                 VALUES (1,22,30,1,1,0)",
+                [],
+            )
+            .unwrap();
+        migrate_v6(&sparse).unwrap();
+        let capacity = sparse
+            .query_row("SELECT slots FROM storage_capacity WHERE account_id=1 AND storage=22", [], |r| r.get::<_, u16>(0))
+            .unwrap();
+        let stored_slot = sparse
+            .query_row("SELECT slot FROM item WHERE account_id=1 AND storage=22", [], |r| r.get::<_, u16>(0))
+            .unwrap();
+        assert_eq!((capacity, stored_slot), (31, 30));
+
+        for (invalid_setup, label) in [
+            ("INSERT INTO storage_capacity VALUES (1,22,65536)", "capacity"),
+            ("INSERT INTO item(character_id,storage,slot,item_id,count,created_at) VALUES (1,22,0,1,65536,0)", "count"),
+            ("INSERT INTO character VALUES (3,1,9223372036854775807); UPDATE character SET bank_zenny=9223372036854775807 WHERE id IN (1,2)", "bank zenny"),
+        ] {
+            let invalid = legacy_db();
+            if label == "bank zenny" {
+                invalid.execute("INSERT INTO character VALUES (3,1,9223372036854775807)", []).unwrap();
+                invalid.execute("UPDATE character SET bank_zenny=9223372036854775807 WHERE id IN (1,2)", []).unwrap();
+            } else {
+                invalid.execute(invalid_setup, []).unwrap();
+            }
+            assert!(migrate_v6(&invalid).is_err(), "{label}");
+            assert_eq!(invalid.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5, "{label}");
+            let expected_items = if label == "count" { 1 } else { 0 };
+            assert_eq!(invalid.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), expected_items, "{label}");
+            assert!(invalid.prepare("SELECT bank_zenny FROM character").is_ok(), "{label}");
+            match label {
+                "capacity" => assert_eq!(invalid.query_row("SELECT slots FROM storage_capacity", [], |r| r.get::<_, i64>(0)).unwrap(), 65536),
+                "count" => assert_eq!(invalid.query_row("SELECT count FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), 65536),
+                "bank zenny" => assert_eq!(invalid.query_row("SELECT COUNT(*) FROM character WHERE bank_zenny=9223372036854775807", [], |r| r.get::<_, i64>(0)).unwrap(), 3),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn v6_migration_rejects_signed_client_capacity_overflow() {
+        for (setup, item_count, expected_capacity, expected_slot) in [
+            ("INSERT INTO storage_capacity VALUES (1,22,32768)", 0, Some(32768), None),
+            ("INSERT INTO item(character_id,storage,slot,item_id,count,created_at) VALUES (1,22,32767,1,1,0)", 1, None, Some(32767)),
+        ] {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE account(id INTEGER PRIMARY KEY);
+                 CREATE TABLE character(id INTEGER PRIMARY KEY, account_id INTEGER, bank_zenny INTEGER);
+                 CREATE TABLE item(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, character_id INTEGER, storage INTEGER,
+                     slot INTEGER, item_id INTEGER, count INTEGER, created_at INTEGER,
+                     UNIQUE(character_id, storage, slot)
+                 );
+                 CREATE TABLE storage_capacity(character_id INTEGER, storage INTEGER, slots INTEGER);
+                 INSERT INTO account VALUES (1);
+                 INSERT INTO character VALUES (1, 1, 0);
+                 PRAGMA user_version=5;",
+            )
+            .unwrap();
+            conn.execute(setup, []).unwrap();
+
+            assert!(migrate_v6(&conn).is_err());
+            assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), item_count);
+            assert!(conn.prepare("SELECT bank_zenny FROM character").is_ok());
+            if let Some(capacity) = expected_capacity {
+                assert_eq!(conn.query_row("SELECT slots FROM storage_capacity", [], |r| r.get::<_, i64>(0)).unwrap(), capacity);
+            }
+            if let Some(slot) = expected_slot {
+                assert_eq!(conn.query_row("SELECT slot FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), slot);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_capacity_rejects_signed_client_overflow() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("capacity-signed").unwrap();
+        assert_eq!(db.storage_capacity(account, 22).unwrap(), 24);
+        db.conn.execute(
+            "UPDATE storage_capacity SET slots=32767 WHERE account_id=?1 AND storage=22",
+            params![account],
+        ).unwrap();
+        assert_eq!(db.storage_capacity(account, 22).unwrap(), 32767);
+        assert!(db.conn.execute(
+            "UPDATE storage_capacity SET slots=32768 WHERE account_id=?1 AND storage=22",
+            params![account],
+        ).is_err());
+        db.conn.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+        db.conn.execute(
+            "UPDATE storage_capacity SET slots=32768 WHERE account_id=?1 AND storage=22",
+            params![account],
+        ).unwrap();
+        assert!(db.storage_capacity(account, 22).is_err());
     }
 
     #[test]
