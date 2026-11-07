@@ -692,6 +692,10 @@ pub fn update_money(total: u64) -> Vec<u8> {
     w.u64(total).u32(0).u8(0);
     w.finish()
 }
+/// ITEM_UPDATE_BANK_MONEY 8/0x21 — u64 account bank Zenny balance.
+pub(crate) fn item_update_bank_money(balance: u64) -> Vec<u8> {
+    balance.to_le_bytes().to_vec()
+}
 
 /// SHOP_BUY 9/0x01 request (writer FUN_18001f9f0): u32 NPC actor, u32
 /// tb_Shop index, u16 count, u8.
@@ -892,26 +896,52 @@ impl InventoryInfoReq {
 /// equip groups use this client's 14 shape slots). 0 = unknown group.
 pub fn storage_slots(group: u8) -> i16 {
     match group {
-        0 | 3 => SHAPE_SLOTS as i16, // shape / look equip
-        1 => 2,                      // ability equip
-        2 | 5 => 24,                 // common bag / storage
-        4 | 6 => 48,                 // costume bag / storage
-        0x0B | 0x0D | 0x0E => 384,   // cube, cash bag, cash storage
+        0 | 3 => SHAPE_SLOTS as i16,
+        1 => 2,
+        storage::COMMON => 24,
+        storage::COSTUME => 48,
+        storage::CASH => 384,
+        storage::NORMAL_BANK => 24,
+        storage::COSTUME_BANK => 48,
+        storage::CASH_BANK => 384,
+        storage::NORMAL_UI => 24,
+        storage::COSTUME_UI => 48,
+        storage::CASH_UI => 384,
+        0x0B => 384,
         _ => 0,
     }
 }
 
-/// ITEM_OPEN_SLOT_INFO 8/0x0E — reader FUN_18001e600 (PlayScene handler
-/// FUN_180dfa290): u8 n, n x {u8 group, i16 slots, u8 grade}. Without it the
-/// inventory has no open slots.
-pub fn open_slot_info(groups: &[u8]) -> Vec<u8> {
-    let mut w = Writer::new();
-    let known: Vec<u8> = groups.iter().copied().filter(|&g| storage_slots(g) > 0).collect();
-    w.u8(known.len() as u8);
-    for g in known {
-        w.u8(g).u16(storage_slots(g) as u16).u8(0);
+/// Serialize slot info for both the UI section and item-storage models.
+pub fn open_slot_info_with(groups: &[u8], capacities: &[(u8, u16)]) -> Vec<u8> {
+    let mut requested = groups.to_vec();
+    if groups.iter().any(|g| matches!(*g, storage::NORMAL_BANK | storage::COSTUME_BANK | storage::CASH_BANK)) {
+        for group in [storage::NORMAL_UI, storage::COSTUME_UI, storage::CASH_UI] {
+            if !requested.contains(&group) { requested.push(group); }
+        }
     }
+    let known: Vec<(u8, u16, u8)> = requested.iter().filter_map(|&g| {
+        let (storage_group, base) = match g {
+            storage::NORMAL_UI => (storage::NORMAL_BANK, 2),
+            storage::COSTUME_UI => (storage::COSTUME_BANK, 2),
+            storage::CASH_UI => (storage::CASH_BANK, 2),
+            _ => (g, 0),
+        };
+        let slots = capacities.iter().find(|(group, _)| *group == storage_group).map(|(_, n)| *n)
+            .unwrap_or_else(|| storage_slots(storage_group).max(0) as u16);
+        if slots == 0 { return None; }
+        let aux = if base == 0 { 0 } else { (slots / 12).saturating_sub(base).min(u16::from(u8::MAX)) as u8 };
+        Some((g, slots, aux))
+    }).collect();
+    let mut w = Writer::new();
+    w.u8(known.len() as u8);
+    for (g, slots, aux) in known { w.u8(g).u16(slots).u8(aux); }
     w.finish()
+}
+
+/// ITEM_OPEN_SLOT_INFO for fixed-capacity groups.
+pub fn open_slot_info(groups: &[u8]) -> Vec<u8> {
+    open_slot_info_with(groups, &[])
 }
 
 /// One item as read by FUN_18001e000 (114 bytes; field order traced by running
@@ -1060,6 +1090,32 @@ pub mod storage {
     pub const COSTUME: u8 = 4;
     pub const CUBE: u8 = 0x0B;
     pub const CASH: u8 = 0x0D;
+    pub const NORMAL_UI: u8 = 5;
+    pub const COSTUME_UI: u8 = 6;
+    pub const CASH_UI: u8 = 14;
+    pub const NORMAL_BANK: u8 = 0x16;
+    pub const COSTUME_BANK: u8 = 0x17;
+    pub const CASH_BANK: u8 = 0x18;
+}
+
+/// Map a bank group or its client alias to the canonical persisted group.
+pub fn bank_storage_group(st: u8) -> Option<u8> {
+    match st {
+        0x10 | storage::NORMAL_BANK => Some(storage::NORMAL_BANK),
+        0x11 | storage::COSTUME_BANK => Some(storage::COSTUME_BANK),
+        0x12 | storage::CASH_BANK => Some(storage::CASH_BANK),
+        _ => None,
+    }
+}
+
+/// Map a canonical persisted bank group to its client-visible alias.
+pub fn client_bank_alias(st: u8) -> Option<u8> {
+    match st {
+        storage::NORMAL_BANK => Some(0x10),
+        storage::COSTUME_BANK => Some(0x11),
+        storage::CASH_BANK => Some(0x12),
+        _ => None,
+    }
 }
 
 /// (Item_Inven_Type, Item_Slot_Type) of an item from tb_Item_Classify.
@@ -1490,6 +1546,33 @@ impl ItemMoveReq {
         let dest = side()?;
         end(&r)?;
         Ok(Self { src, dest })
+    }
+}
+
+/// ITEM_MOVE_MONEY 8/0x24: u8 direction (0 withdraw, 1 deposit), u64 amount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemMoveMoneyReq {
+    pub direction: u8,
+    pub amount: u64,
+}
+
+impl ItemMoveMoneyReq {
+    pub fn parse(p: &[u8]) -> Result<Self, ParseError> {
+        if p.len() != 9 {
+            return Err(if p.len() > 9 {
+                ParseError::TrailingBytes(p.len() - 9)
+            } else {
+                ParseError::Read("not enough bytes for bank money transfer")
+            });
+        }
+        let mut r = Reader::new(p);
+        let direction = r.u8()?;
+        if direction > 1 {
+            return Err(ParseError::Read("invalid bank money direction"));
+        }
+        let amount = r.u64()?;
+        end(&r)?;
+        Ok(Self { direction, amount })
     }
 }
 

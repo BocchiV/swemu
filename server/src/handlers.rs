@@ -170,8 +170,11 @@ pub fn dispatch(s: &mut Session, f: &Packet) -> Result<()> {
                     spawn_monsters(s, map, None);
                 }
                 send_maze_state(s);
-            }
+                if let Some(account) = s.account_id {
+                    refresh_bank(s, account);
+                }
         }
+            }
         // 17/0x22 (empty, writer FUN_1805f7950): sent once a maze map has
         // loaded on the same connection; no reply handler in PlayScene.
         // Spawn the maze's map-load monsters here.
@@ -269,20 +272,18 @@ pub fn dispatch(s: &mut Session, f: &Packet) -> Result<()> {
         }
         (Role::Game, MAIN_ITEM, 0x02) => {
             let req = proto::ItemMoveReq::parse(&f.payload)?;
-            if let Some(character) = s.character_id {
-                move_item(s, character, req);
-            }
+            if let (Some(account), Some(character)) = (s.account_id, s.character_id) { move_item(s, account, character, req); }
         }
         (Role::Game, MAIN_ITEM, 0x03) => {
             let req = proto::ItemCombineReq::parse(&f.payload)?;
-            if let Some(character) = s.character_id {
-                combine_items(s, character, req);
+            if let (Some(account), Some(character)) = (s.account_id, s.character_id) {
+                combine_items(s, account, character, req);
             }
         }
         (Role::Game, MAIN_ITEM, 0x04) => {
             let req = proto::ItemDivideReq::parse(&f.payload)?;
-            if let Some(character) = s.character_id {
-                divide_item(s, character, req);
+            if let (Some(account), Some(character)) = (s.account_id, s.character_id) {
+                divide_item(s, account, character, req);
             }
         }
         (Role::Game, MAIN_ITEM, 0x05) => {
@@ -293,22 +294,46 @@ pub fn dispatch(s: &mut Session, f: &Packet) -> Result<()> {
         }
         (Role::Game, MAIN_ITEM, 0x25) => {
             let st = *f.payload.first().ok_or(proto::ParseError::TrailingBytes(0))?;
-            if let Some(character) = s.character_id {
-                line_up(s, character, st);
-            }
+            if let (Some(account), Some(character)) = (s.account_id, s.character_id) { line_up(s, account, character, st); }
+        }
+        (Role::Game, MAIN_ITEM, 0x24) => {
+            let req = proto::ItemMoveMoneyReq::parse(&f.payload)?;
+            if let (Some(account), Some(character)) = (s.account_id, s.character_id) { move_bank_money(s, account, character, req); }
         }
         (Role::Game, MAIN_ITEM, 0x11) => {
             let req = proto::ItemUseReq::parse(&f.payload)?;
-            if let Some(character) = s.character_id {
-                use_item(s, character, &req);
+            if let (Some(account), Some(character)) = (s.account_id, s.character_id) {
+                use_item(s, account, character, &req);
             }
         }
+        (Role::Game, MAIN_ITEM, 0x0F) => {
+            let Some(&mode) = f.payload.first() else {
+                return Err(proto::ParseError::TrailingBytes(0).into());
+            };
+            if f.payload.len() != 1 {
+                return Err(proto::ParseError::TrailingBytes(1).into());
+            }
+            if let (Some(account), Some(character)) = (s.account_id, s.character_id) {
+                add_storage_slots(s, account, character, mode);
+            }
+        }
+
         (Role::Game, MAIN_ITEM, 0x01) => {
             let req = proto::InventoryInfoReq::parse(&f.payload)?;
             if s.character_id.is_some() {
-                s.send(MAIN_ITEM, 0x0E, proto::open_slot_info(&req.groups));
+                let has_bank = req.groups.iter().any(|g| matches!(*g, proto::storage::NORMAL_UI | proto::storage::COSTUME_UI | proto::storage::CASH_UI | proto::storage::NORMAL_BANK | proto::storage::COSTUME_BANK | proto::storage::CASH_BANK));
+                let capacities: Vec<_> = if has_bank {
+                    s.account_id.map(|account| {
+                        let db = s.shared.db.lock().unwrap();
+                        [proto::storage::NORMAL_BANK, proto::storage::COSTUME_BANK, proto::storage::CASH_BANK].into_iter().map(|g| (g, db.storage_capacity(account, g).unwrap_or_else(|_| proto::storage_slots(g) as u16))).collect()
+                    }).unwrap_or_default()
+                } else { Vec::new() };
+                s.send(MAIN_ITEM, 0x0E, proto::open_slot_info_with(&req.groups, &capacities));
                 send_inventory(s);
             }
+        }
+        (Role::Game, MAIN_ITEM, 0x10) => {
+            if let Some(account) = s.account_id.filter(|_| s.character_id.is_some()) { refresh_bank(s, account); }
         }
         (Role::Game, MAIN_SHOP, 0x01) => {
             let req = proto::ShopBuyReq::parse(&f.payload)?;
@@ -1185,14 +1210,35 @@ fn refresh_slots(s: &mut Session, character: u32, slots: &[(u8, u16)]) {
     }
 }
 
-/// ITEM_COMBINE 8/0x03: stack `count` of src onto the same item at dest.
-fn combine_items(s: &mut Session, character: u32, req: proto::ItemCombineReq) {
+/// ITEM_COMBINE 8/0x03: bag stacks or same-group account bank stacks.
+fn combine_items(s: &mut Session, account: u32, character: u32, req: proto::ItemCombineReq) {
+    let src_bank = proto::bank_storage_group(req.src.0);
+    let dest_bank = proto::bank_storage_group(req.dest.0);
+    if src_bank.is_some() || dest_bank.is_some() {
+        let Some(storage) = src_bank.filter(|storage| Some(*storage) == dest_bank) else {
+            refresh_bank(s, account);
+            return;
+        };
+        let db = s.shared.db.lock().unwrap();
+        let stack = db.bank_items(account).unwrap_or_default().into_iter()
+            .find(|i| i.storage == storage && i.slot == req.src.1)
+            .and_then(|i| proto::item_prices(i.item_id)).map_or(1, |p| p.2.max(1));
+        let result = db.combine_bank_items(account, storage, req.src.1, req.dest.1, req.count, stack);
+        drop(db);
+        match result {
+            Ok(Some((mut a, mut b))) => {
+                a.storage = req.src.0;
+                b.storage = req.dest.0;
+                s.send(MAIN_ITEM, 0x03, proto::item_combine_res(character, &a, &b));
+            }
+            Ok(None) => refresh_bank(s, account),
+            Err(e) => warn!(conn = s.id, error = %e, "bank item combine: db error"),
+        }
+        return;
+    }
     let items = s.shared.db.lock().unwrap().items(character).unwrap_or_default();
-    let stack = items
-        .iter()
-        .find(|i| (i.storage, i.slot) == req.src)
-        .and_then(|i| proto::item_prices(i.item_id))
-        .map_or(1, |p| p.2.max(1));
+    let stack = items.iter().find(|i| (i.storage, i.slot) == req.src)
+        .and_then(|i| proto::item_prices(i.item_id)).map_or(1, |p| p.2.max(1));
     let result = s.shared.db.lock().unwrap().combine_items(character, req.src, req.dest, req.count, stack);
     match result {
         Ok(Some((a, b))) => {
@@ -1207,8 +1253,36 @@ fn combine_items(s: &mut Session, character: u32, req: proto::ItemCombineReq) {
     }
 }
 
-/// ITEM_DIVIDE 8/0x04: split a stack into an empty slot.
-fn divide_item(s: &mut Session, character: u32, req: proto::ItemDivideReq) {
+/// ITEM_DIVIDE 8/0x04: bag stacks or same-group account bank stacks.
+fn divide_item(s: &mut Session, account: u32, character: u32, req: proto::ItemDivideReq) {
+    let src_bank = proto::bank_storage_group(req.src.0);
+    let dest_bank = proto::bank_storage_group(req.dest.0);
+    if src_bank.is_some() || dest_bank.is_some() {
+        let Some(storage) = src_bank.filter(|storage| Some(*storage) == dest_bank) else {
+            refresh_bank(s, account);
+            return;
+        };
+        let bag_storage = match storage {
+            22 => proto::storage::COMMON,
+            23 => proto::storage::COSTUME,
+            24 => proto::storage::CASH,
+            _ => unreachable!("bank storage group was normalized"),
+        };
+        let result = s.shared.db.lock().unwrap().divide_bank_item(
+            account, storage, req.src.1, req.dest.1, req.count,
+            |item_id, _, _| proto::item_fits(item_id, bag_storage, 0),
+        );
+        match result {
+            Ok(Some((mut a, mut b))) => {
+                a.storage = req.src.0;
+                b.storage = req.dest.0;
+                s.send(MAIN_ITEM, 0x04, proto::item_divide_res(&a, &b));
+            }
+            Ok(None) => refresh_bank(s, account),
+            Err(e) => warn!(conn = s.id, error = %e, "bank item divide: db error"),
+        }
+        return;
+    }
     let result = s.shared.db.lock().unwrap().divide_item(character, req.src, req.dest, req.count, proto::item_fits);
     match result {
         Ok(Some((a, b))) => {
@@ -1249,25 +1323,110 @@ fn discard_item(s: &mut Session, character: u32, req: proto::ItemBreakReq) {
     }
 }
 
-/// ITEM_LINE_UP 8/0x25: the bag's sort button.
-fn line_up(s: &mut Session, character: u32, st: u8) {
-    if !proto::bag_storage(st) {
-        warn!(conn = s.id, storage = st, "line up refused: not a bag");
+/// ITEM_LINE_UP 8/0x25: sort bag or account bank storage.
+fn line_up(s: &mut Session, account: u32, character: u32, st: u8) {
+    if proto::bag_storage(st) {
+        let result = s.shared.db.lock().unwrap().line_up(character, st);
+        match result {
+            Ok(items) => {
+                info!(conn = s.id, storage = st, items = items.len(), "item line up");
+                s.send(MAIN_ITEM, 0x25, proto::item_line_up_res(st, &items));
+            }
+            Err(e) => warn!(conn = s.id, error = %e, "line up: db error"),
+        }
         return;
     }
-    let result = s.shared.db.lock().unwrap().line_up(character, st);
+    let storage_group = match st { 5 => 22, 6 => 23, 14 => 24, _ => st };
+    let Some(storage) = proto::bank_storage_group(storage_group) else {
+        warn!(conn = s.id, storage = st, "line up refused: unsupported storage");
+        return;
+    };
+    let result = s.shared.db.lock().unwrap().line_up_bank(account, storage);
     match result {
-        Ok(items) => {
-            info!(conn = s.id, storage = st, items = items.len(), "item line up");
+        Ok(mut items) => {
+            for item in &mut items { item.storage = st; }
+            info!(conn = s.id, storage = st, items = items.len(), "bank line up");
             s.send(MAIN_ITEM, 0x25, proto::item_line_up_res(st, &items));
         }
-        Err(e) => warn!(conn = s.id, error = %e, "line up: db error"),
+        Err(e) => warn!(conn = s.id, error = %e, "bank line up: db error"),
     }
 }
 
+/// Add Slots item-card action, table-backed Normal and Costume banks.
+fn add_storage_slots(s: &mut Session, account: u32, character: u32, mode: u8) {
+    let (storage, option) = match mode { 0 => (proto::storage::NORMAL_BANK, 0), 1 => (proto::storage::COSTUME_BANK, 1), _ => return };
+    let current = match s.shared.db.lock().unwrap().storage_capacity(account, storage) {
+        Ok(capacity) => capacity,
+        Err(error) => { warn!(conn = s.id, storage, error = %error, "add slots: capacity lookup failed"); return; }
+    };
+    let next = current.saturating_add(12);
+    let candidate = crate::gamedata::BANK_SLOT_EXTEND.iter().find_map(
+        |&(_level, normal_item, normal_increment, normal_capacity, costume_item, costume_increment, costume_capacity)| {
+            let (item_id, increment, capacity) = if option == 0 {
+                (normal_item, normal_increment, normal_capacity)
+            } else { (costume_item, costume_increment, costume_capacity) };
+            (item_id != 0 && increment == 12 && capacity == next).then_some((item_id, capacity))
+        },
+    );
+    let Some((item_id, capacity)) = candidate else { return; };
+    let Some((inven, _)) = proto::item_class(item_id) else { return; };
+    let source_storage = proto::home_storage(inven);
+    let result = s.shared.db.lock().unwrap().consume_storage_expansion(
+        account, character, source_storage, storage, None, item_id, 1, capacity,
+    );
+    let Ok(Some((used, capacity))) = result else { return; };
+    s.send(MAIN_ITEM, 0x15, proto::item_update(&[used]));
+    let aux = (capacity / 12).saturating_sub(2).min(u16::from(u8::MAX)) as u8;
+    let mut response = vec![mode, aux];
+    response.extend_from_slice(&capacity.to_le_bytes());
+    s.send(MAIN_ITEM, 0x0F, response);
+    refresh_bank(s, account);
+}
+
+fn move_bank_money(s: &mut Session, account: u32, character: u32, req: proto::ItemMoveMoneyReq) {
+    let direction = match req.direction {
+        1 => crate::db::BankZennyDirection::Deposit,
+        0 => crate::db::BankZennyDirection::Withdraw,
+        _ => unreachable!("parser validates bank money direction"),
+    };
+    let start = s.shared.cfg.start_zenny;
+    let result = s.shared.db.lock().unwrap().transfer_bank_zenny(account, character, direction, req.amount, start);
+    let wallet = match result {
+        Ok(Some((wallet, _bank))) => wallet,
+        Ok(None) => s.shared.db.lock().unwrap().zenny(character, start).unwrap_or(0),
+        Err(error) => {
+            warn!(conn = s.id, error = %error, "bank Zenny transfer failed");
+            s.shared.db.lock().unwrap().zenny(character, start).unwrap_or(0)
+        }
+    };
+    s.send(MAIN_ITEM, 0x20, proto::update_money(wallet));
+    refresh_bank(s, account);
+}
+
+fn refresh_bank(s: &mut Session, account: u32) {
+    let groups = [proto::storage::NORMAL_BANK, proto::storage::COSTUME_BANK, proto::storage::CASH_BANK];
+    let db = s.shared.db.lock().unwrap();
+    let capacities = groups.map(|group| (group, db.storage_capacity(account, group)
+        .unwrap_or_else(|_| proto::storage_slots(group) as u16)));
+    let mut bank = db.bank_items(account).unwrap_or_default();
+    for item in &mut bank { item.storage = proto::client_bank_alias(item.storage).unwrap_or(item.storage); }
+    let balance = db.bank_zenny_balance(account);
+    drop(db);
+    s.send(MAIN_ITEM, 0x0E, proto::open_slot_info_with(&groups, &capacities));
+    s.send(MAIN_ITEM, 0x10, proto::inventory_info(&bank));
+    match balance {
+        Ok(balance) => match u64::try_from(balance) {
+            Ok(balance) => s.send(MAIN_ITEM, 0x21, proto::item_update_bank_money(balance)),
+            Err(_) => warn!(conn = s.id, account, balance = %balance, "bank Zenny balance exceeds client u64 range"),
+        },
+        Err(error) => warn!(conn = s.id, account, error = %error, "bank Zenny balance read failed"),
+    }
+}
+
+
 /// ITEM_USE: boxes (tb_Item_Package) are swapped for their contents. Anything
 /// else is answered with an empty use so the client does not wait.
-fn use_item(s: &mut Session, character: u32, req: &proto::ItemUseReq) {
+fn use_item(s: &mut Session, account: u32, character: u32, req: &proto::ItemUseReq) {
     let item_id = {
         let items = s.shared.db.lock().unwrap().items(character).unwrap_or_default();
         items.iter().find(|i| i.serial == req.serial).map(|i| i.item_id)
@@ -1276,6 +1435,37 @@ fn use_item(s: &mut Session, character: u32, req: &proto::ItemUseReq) {
         warn!(conn = s.id, serial = req.serial, storage = req.storage, slot = req.slot, "item use: not this character's item");
         return;
     };
+
+    if item_id == 6_001_026 {
+        let result = {
+            let db = s.shared.db.lock().unwrap();
+            let current = db.storage_capacity(account, proto::storage::NORMAL_BANK)
+                .unwrap_or(proto::storage_slots(proto::storage::NORMAL_BANK) as u16);
+            if current >= 48 { Ok(None) } else {
+                db.consume_storage_expansion(
+                    account, character, req.storage, proto::storage::NORMAL_BANK,
+                    Some((req.serial, req.slot)), item_id, 1, current + 12,
+                )
+            }
+        };
+        match result {
+            Ok(Some((used, _capacity))) => {
+                s.send(MAIN_ITEM, 0x15, proto::item_update(&[used]));
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
+                refresh_bank(s, account);
+            }
+            Ok(None) => {
+                warn!(conn = s.id, item_id, "storage expansion refused");
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
+            }
+            Err(error) => {
+                warn!(conn = s.id, item_id, error = %error, "storage expansion failed");
+                s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
+            }
+        }
+        return;
+    }
+
     let Some(&(_, contents)) = crate::gamedata::ITEM_PACKAGE.iter().find(|p| p.0 == item_id) else {
         info!(conn = s.id, item_id, "item use: not a box (no effect implemented)");
         s.send(MAIN_ITEM, 0x11, proto::item_use_res(item_id, &[]));
@@ -1306,17 +1496,47 @@ fn use_item(s: &mut Session, character: u32, req: &proto::ItemUseReq) {
 /// ITEM_MOVE: drag between bag slots, equip (bag -> shape/look/gear slot) and
 /// unequip. A done move is answered with what the two slots hold now; a
 /// refused one with an empty reply (the client applies entries as moves).
-fn move_item(s: &mut Session, character: u32, req: proto::ItemMoveReq) {
-    let result =
-        s.shared.db.lock().unwrap().move_item(character, req.src, req.dest, proto::item_fits, &[proto::WEAPON_SLOT]);
+/// ITEM_MOVE: bag/equip movement plus matching bag↔bank pairs.
+fn move_item(s: &mut Session, account: u32, character: u32, req: proto::ItemMoveReq) {
+    let storage_for_db = |storage| proto::bank_storage_group(storage).unwrap_or(storage);
+    let src = (storage_for_db(req.src.0), req.src.1);
+    let dest = (storage_for_db(req.dest.0), req.dest.1);
+    let result = {
+        let db = s.shared.db.lock().unwrap();
+        let capacities: Vec<(u8, u16)> = [
+            proto::storage::NORMAL_BANK, proto::storage::COSTUME_BANK, proto::storage::CASH_BANK,
+        ].into_iter().map(|storage| (storage, db.storage_capacity(account, storage).unwrap_or(0))).collect();
+        let in_range = |(storage, slot): (u8, u16)| {
+            !matches!(storage, proto::storage::NORMAL_BANK | proto::storage::COSTUME_BANK | proto::storage::CASH_BANK)
+                || slot < capacities.iter().find(|(group, _)| *group == storage).map_or(0, |(_, slots)| *slots)
+        };
+        if !in_range(src) || !in_range(dest) {
+            None
+        } else {
+            let fits = |item: u32, storage: u8, slot: u16| {
+                if matches!(storage, proto::storage::NORMAL_BANK | proto::storage::COSTUME_BANK | proto::storage::CASH_BANK) {
+                    let bag = match storage {
+                        proto::storage::NORMAL_BANK => proto::storage::COMMON,
+                        proto::storage::COSTUME_BANK => proto::storage::COSTUME,
+                        proto::storage::CASH_BANK => proto::storage::CASH,
+                        _ => unreachable!(),
+                    };
+                    proto::cash_item_storage(item) == bag
+                        && slot < capacities.iter().find(|(group, _)| *group == storage).map_or(0, |(_, slots)| *slots)
+                } else { proto::item_fits(item, storage, slot) }
+            };
+            Some(db.move_item(account, character, src, dest, fits, &[proto::WEAPON_SLOT]))
+        }
+    };
+    let Some(result) = result else {
+        s.send(MAIN_ITEM, 0x02, proto::item_move_refused());
+        return;
+    };
     let (src_item, dest_item) = match result {
-        Ok((a, b, moved)) => {
-            info!(conn = s.id, src = ?req.src, dest = ?req.dest, item = b.map(|i| i.item_id), moved, "item move");
-            if !moved {
-                s.send(MAIN_ITEM, 0x02, proto::item_move_refused());
-                return;
-            }
-            (a, b)
+        Ok((a, b, true)) => (a, b),
+        Ok(_) => {
+            s.send(MAIN_ITEM, 0x02, proto::item_move_refused());
+            return;
         }
         Err(e) => {
             warn!(conn = s.id, error = %e, "item move: db error");
@@ -1324,14 +1544,10 @@ fn move_item(s: &mut Session, character: u32, req: proto::ItemMoveReq) {
             return;
         }
     };
-    s.send(
-        MAIN_ITEM,
-        0x02,
-        proto::item_move_res(
-            (req.src.0, req.src.1, src_item.map(|i| i.item_id)),
-            (req.dest.0, req.dest.1, dest_item.map(|i| i.item_id)),
-        ),
-    );
+    s.send(MAIN_ITEM, 0x02, proto::item_move_res(
+        (req.src.0, req.src.1, src_item.map(|item| item.item_id)),
+        (req.dest.0, req.dest.1, dest_item.map(|item| item.item_id)),
+    ));
 }
 
 /// GM level of the session's account: 1 if its name is in cfg.gm_accounts.

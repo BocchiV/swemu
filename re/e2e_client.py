@@ -109,6 +109,23 @@ def parse_login_result(p):
     session = struct.unpack_from("<Q", p, o)[0]
     return account, err, msg, auth, session
 
+def character_ids(payload):
+    count = payload[0]
+    offset = 1
+    result = {}
+    for _ in range(count):
+        character = struct.unpack_from("<I", payload, offset)[0]
+        name, name_end = wstr_at(payload, offset + 4)
+        result[name] = character
+        offset = name_end + 603
+    return result
+
+
+def character_id(payload, name):
+    ids = character_ids(payload)
+    assert name in ids, (name, tuple(ids))
+    return ids[name]
+
 
 def main():
     argv = sys.argv[1:]
@@ -418,10 +435,20 @@ def main():
         m, sub, p = w3.recv()
         assert (m, sub) == (1, 0x06), ("non-GM must get no reply to 7/0x0A", m, sub)
         print("[ok] GM 7/0x0A from a non-GM account is ignored")
+    if gm_expected:
+        bank_serial = personal_storage_checks(emu, w3, struct.unpack_from("<Q", info_payload, zenny_off)[0])
+        account_storage_fresh_login(
+            emu, host, port, mode, user, mac, account, shost, sport, cid2, pin, bank_serial)
     w3.send(0xF1, 0x01, b"")
     m, sub, p = w3.recv()
     assert (m, sub) == (4, 0x22) and struct.unpack_from("<H", p, 0)[0] == 36 and len(p) == 2 + 36 * 49, (m, sub, p[:2], len(p))
     print("[ok] CHANNEL_INFO F1/01 -> WORLD_OTHER_INFOS_NPC 4/0x22 with Rocco Town's 36 NPCs")
+    m, sub, bank_capacity = w3.recv()
+    assert (m, sub) == (8, 0x0E) and bank_capacity[0] == 6, (m, sub, bank_capacity[:1])
+    m, sub, bank_items = w3.recv()
+    assert (m, sub) == (8, 0x10), (m, sub)
+    m, sub, bank_zenny = w3.recv()
+    assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", bank_zenny)[0] == 0, (m, sub, bank_zenny)
     w3.send(8, 0x01, bytes([6, 0, 3, 1, 2, 4, 0x0D]))
     m, sub, p = w3.recv()
     assert (m, sub) == (8, 0x0E) and p[0] == 6, (m, sub, p[:1])
@@ -598,6 +625,12 @@ def main():
         load_mons = [(struct.unpack_from("<I", p, 2 + i * 123)[0], *struct.unpack_from("<ff", p, 2 + i * 123 + 4),
                       struct.unpack_from("<I", p, 2 + i * 123 + 45)[0])
                      for i in range(struct.unpack_from("<H", p, 0)[0])]
+        m, sub, bank_capacity = w4.recv()
+        assert (m, sub) == (8, 0x0E) and bank_capacity[0] == 6, (m, sub, bank_capacity[:1])
+        m, sub, bank_items = w4.recv()
+        assert (m, sub) == (8, 0x10), (m, sub)
+        m, sub, bank_zenny = w4.recv()
+        assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", bank_zenny)[0] == 0, (m, sub, bank_zenny)
         w4.send(0x11, 0x31, struct.pack("<I", 80101))
         m, sub, p = w4.recv()
         assert (m, sub) == (4, 0x23) and struct.unpack_from("<H", p, 0)[0] == 2, (m, sub, p[:2])
@@ -919,6 +952,249 @@ def create_payload(name):
     w = name.encode("utf-16-le")
     return p[:4] + struct.pack("<H", len(w)) + w + p[6 + n:]
 
+def personal_storage_checks(emu, conn, wallet):
+    """Exercise storage packets, aliases, sorting, stack operations, and extensions."""
+    reply_start = len(conn.replies)
+    def recv(main, sub):
+        while True:
+            m, s, payload = conn.recv()
+            if (m, s) == (3, 0x51):
+                continue
+            assert (m, s) == (main, sub), (m, s, payload[:16])
+            return payload
 
+    def records(payload):
+        n = struct.unpack_from("<I", payload)[0]
+        return [(payload[4 + i * 118],
+                 struct.unpack_from("<H", payload, 5 + i * 118)[0],
+                 struct.unpack_from("<I", payload, 7 + i * 118)[0],
+                 struct.unpack_from("<Q", payload, 11 + i * 118)[0],
+                 struct.unpack_from("<H", payload, 19 + i * 118)[0])
+                for i in range(n)]
+
+    def grant(item, count=1):
+        cmd = f"/item {item} {count}".encode("utf-16-le")
+        conn.send(7, 0x0A, struct.pack("<H", len(cmd)) + cmd)
+        update = None
+        while True:
+            m, s, payload = conn.recv()
+            if (m, s) == (3, 0x51):
+                continue
+            if (m, s) == (8, 0x15):
+                update = payload
+            elif (m, s) == (7, 0x01):
+                break
+            else:
+                raise AssertionError((m, s, payload[:16]))
+        row = next(r for r in records(update) if r[2] == item)
+        return row
+
+    def bank(request=True):
+        if request:
+            conn.send(8, 0x10, b"")
+        info = recv(8, 0x0E)
+        rows = records(recv(8, 0x10))
+        zenny = struct.unpack_from("<Q", recv(8, 0x21))[0]
+        return info, rows, zenny
+
+    def move(item, destination, slot):
+        source, source_slot, item_id, _, _ = item
+        wire = {0x16: 0x10, 0x17: 0x11, 0x18: 0x12}
+        src, dst = wire.get(source, source), wire.get(destination, destination)
+        conn.send(8, 0x02, struct.pack(
+            "<BIHBBIHB", src, item_id, source_slot, 0, dst, item_id, slot, 0))
+        response = recv(8, 0x02)
+        assert response[0] == 1, response
+        assert struct.unpack_from("<BiH", response, 1) == (src, -1, source_slot)
+        assert struct.unpack_from("<BiH", response, 9) == (dst, item_id, slot)
+
+    info, rows, zenny = bank()
+    assert not rows and zenny == 0, (rows, zenny)
+    amount = 1
+    conn.send(8, 0x24, struct.pack("<BQ", 1, amount))
+    assert struct.unpack_from("<Q", recv(8, 0x20))[0] == wallet - amount
+    assert bank(request=False)[2] == amount
+    conn.send(8, 0x24, struct.pack("<BQ", 0, amount))
+    assert struct.unpack_from("<Q", recv(8, 0x20))[0] == wallet
+    assert bank(request=False)[2] == 0
+
+    normal = grant(800004001)
+    second = grant(800002001)
+    move(normal, 0x16, 0)
+    info, rows, _ = bank()
+    stored = next(r for r in rows if r[0] == 0x10 and r[2] == normal[2])
+    costume = grant(213881001)
+    cash_item = grant(6000451)
+    move(costume, 0x17, 0)
+    move(cash_item, 0x18, 0)
+    alias_rows = bank()[1]
+    assert any(r[0] == 0x11 and r[2] == costume[2] and r[3] == costume[3] for r in alias_rows), alias_rows
+    assert any(r[0] == 0x12 and r[2] == cash_item[2] and r[3] == cash_item[3] for r in alias_rows), alias_rows
+    move(next(r for r in alias_rows if r[2] == costume[2]), costume[0], costume[1])
+    move(next(r for r in bank()[1] if r[2] == cash_item[2]), cash_item[0], cash_item[1])
+    for temporary in (costume, cash_item):
+        conn.send(8, 0x05, struct.pack("<BHQI", temporary[0], temporary[1], temporary[3], temporary[4]))
+        assert recv(8, 0x05) == struct.pack("<BHQ", temporary[0], temporary[1], temporary[3])
+    assert stored[1] == 0 and stored[3] == normal[3]
+    move(second, 0x16, 7)
+    before_sort = [r for r in bank()[1] if r[0] == 0x10]
+    expected = sorted((r[2], r[3]) for r in before_sort)
+    conn.send(8, 0x25, b"\x05")
+    reply = recv(8, 0x25)
+    count = struct.unpack_from("<H", reply, 1)[0]
+    echoed = [(struct.unpack_from("<H", reply, 4 + i * 13)[0],
+               struct.unpack_from("<Q", reply, 6 + i * 13)[0]) for i in range(count)]
+    assert reply[0] == 5 and len(reply) == 3 + count * 13 and count == 2, reply
+    assert all(reply[3 + i * 13] == 5 for i in range(count)), reply
+    after_sort = [r for r in bank()[1] if r[0] == 0x10]
+    assert [(r[1], r[3]) for r in after_sort] == echoed, after_sort
+    assert [(r[2], r[3]) for r in after_sort] == expected, after_sort
+    assert [r[1] for r in after_sort] == [0, 1], after_sort
+    for stored_item in after_sort:
+        origin = normal if stored_item[2] == normal[2] else second
+        move(stored_item, origin[0], origin[1])
+    assert not [r for r in bank()[1] if r[0] == 0x10]
+    conn.send(8, 0x05, struct.pack("<BHQI", second[0], second[1], second[3], second[4]))
+    assert recv(8, 0x05) == struct.pack("<BHQ", second[0], second[1], second[3])
+
+    # Split then recombine a stack in the aliased account-bank group.
+    stack = grant(800004001, 3)
+    move(stack, 0x16, 1)
+    conn.send(8, 0x04, struct.pack("<BIHBHH", 0x10, stack[2], 1, 0x10, 2, 1))
+    split = recv(8, 0x04)
+    assert len(split) == 134 and struct.unpack_from("<IBHH", split) == (
+        stack[2], 0x10, 1, stack[4] - 1)
+    split_serial = struct.unpack_from("<Q", split, 24)[0]
+    rows = [r for r in bank()[1] if r[0] == 0x10 and r[2] == stack[2]]
+    assert {(r[1], r[3], r[4]) for r in rows} == {
+        (1, stack[3], stack[4] - 1), (2, split_serial, 1)}
+    conn.send(8, 0x03, struct.pack(
+        "<BIHBBIHBH", 0x10, stack[2], 2, 0, 0x10, stack[2], 1, 0, 1))
+    combined = recv(8, 0x03)
+    assert len(combined) == 247
+    rows = [r for r in bank()[1] if r[0] == 0x10 and r[2] == stack[2]]
+    assert len(rows) == 1 and rows[0][1] == 1 and rows[0][4] == stack[4]
+    move(rows[0], stack[0], stack[1])
+    conn.send(8, 0x05, struct.pack("<BHQI", stack[0], stack[1], stack[3], stack[4]))
+    assert recv(8, 0x05) == struct.pack("<BHQ", stack[0], stack[1], stack[3])
+
+    card = grant(837000002, 2)
+    for mode, expected_capacity in ((0, 36), (1, 60)):
+        conn.send(8, 0x0F, bytes((mode,)))
+        update = records(recv(8, 0x15))
+        assert any(r[2] == 837000002 and r[4] == (1 if mode == 0 else 0) for r in update), update
+        assert recv(8, 0x0F) == bytes((mode, 1 if mode == 0 else 3)) + struct.pack("<H", expected_capacity)
+        slot_info = recv(8, 0x0E)
+        capacities = {slot_info[1 + i * 4]:
+                      (struct.unpack_from("<H", slot_info, 2 + i * 4)[0], slot_info[4 + i * 4])
+                      for i in range(slot_info[0])}
+        assert capacities[5] == (36, 1) and capacities[6] == (expected_capacity if mode else 48, 3 if mode else 2), capacities
+        assert capacities[0x16] == (36, 0), capacities
+        records(recv(8, 0x10))
+        assert struct.unpack_from("<Q", recv(8, 0x21))[0] == zenny
+    move(normal, 0x16, 24)
+    stored = next(r for r in bank()[1] if r[0] == 0x10 and r[2] == normal[2])
+    expansion = grant(6001026, 3)
+    conn.send(8, 0x11, struct.pack("<BHQB", expansion[0], expansion[1], expansion[3], 1))
+    update = records(recv(8, 0x15))
+    assert any(r[2] == 6001026 and r[4] == 2 for r in update), update
+    assert struct.unpack_from("<I", recv(8, 0x11))[0] == 6001026
+    extension_info = recv(8, 0x0E)
+    extension_caps = {extension_info[1 + i * 4]:
+                      (struct.unpack_from("<H", extension_info, 2 + i * 4)[0], extension_info[4 + i * 4])
+                      for i in range(extension_info[0])}
+    assert extension_caps[5] == (48, 2) and extension_caps[0x16] == (48, 0), extension_caps
+    records(recv(8, 0x10))
+    assert struct.unpack_from("<Q", recv(8, 0x21))[0] == 0
+    errors = check_payloads(conn.replies[reply_start:], emu)
+    assert not errors, f"client readers rejected personal-storage packets: {errors}"
+    print("[ok] personal storage: Zenny, bank aliases/sort, stack split/combine, Add Slots Normal/Costume and item-use readers")
+    return normal[3]
+
+
+def account_storage_fresh_login(emu, host, port, mode, user, mac, account,
+                                shost, sport, character_id, pin, bank_serial):
+    """Relog the same account and verify its account-owned bank state."""
+    login = ClientConn(emu, host, port, mode)
+    login.send(2, 1, client_login_payload(emu, user, "right-pass", mac))
+    account_id, err, _, _, ticket = parse_login_result(login.recv()[2])
+    assert err == 0 and account_id == account, (err, account_id)
+    login.send(2, 3, struct.pack("<I", account))
+    listing = login.recv()[2]
+    server_id = struct.unpack_from("<H", listing, 2)[0]
+    login.send(2, 5, struct.pack("<H", server_id))
+    assert login.recv()[:2] == (2, 0x11)
+
+    game = ClientConn(emu, shost, sport, mode)
+    game.send(2, 0x13, struct.pack("<IHQB", account, server_id, ticket, 0))
+    assert game.recv()[2][0] == 0
+    game.send(3, 0x11, struct.pack("<Q", ticket))
+    chars = game.recv()[2]
+    assert character_id in character_ids(chars).values(), character_ids(chars)
+    game.send(3, 0x17, b"\x02" + struct.pack("<H", 6) + pin.encode())
+    assert game.recv()[2] == struct.pack("<IB", 0, 2)
+    game.send(3, 0x0D, b"")
+    assert game.recv()[:2] == (3, 0x0D)
+    character_name = "Bank" + os.urandom(3).hex()
+    game.send(3, 0x01, create_payload(character_name))
+    m, sub, listing = game.recv()
+    assert (m, sub) == (3, 0x12), (m, sub)
+    character_id = character_ids(listing)[character_name]
+    game.send(3, 0x13, struct.pack("<IIBII", character_id, 0, 0, 0, 0))
+    world_host, world_port, instance, result = select_result(game.recv()[2])
+    assert result == 0
+    world = ClientConn(emu, world_host, world_port, mode)
+    world.send(3, 0x21, struct.pack("<IIQBQ", account, 0, instance, 1, 0))
+    assert struct.unpack_from("<I", world.recv()[2])[0] == 0
+    world.send(3, 0x31, struct.pack("<IB", character_id, 1))
+    while True:
+        m, sub, payload = world.recv()
+        if (m, sub) == (3, 0x32):
+            break
+    private_wallet = struct.unpack_from("<Q", payload, len(payload) - 78 - 8)[0]
+    assert private_wallet == 1_000_000, private_wallet
+    m, sub, quest_complete = world.recv()
+    assert (m, sub) == (0x15, 0x01)
+    m, sub, quests = world.recv()
+    assert (m, sub) == (0x15, 0x02) and quests == bytes(4)
+    m, sub, skill = world.recv()
+    assert (m, sub) == (6, 0x70)
+    world.send(1, 0x06, struct.pack("<QQI", 0x1122334455, 0, 0x8F))
+    assert world.recv()[:2] == (1, 0x06)
+    world.send(4, 0x06, b"")
+    assert world.recv()[:2] == (0x23, 0x02)
+    assert world.recv()[:2] == (3, 0x51)
+    recv_cash_shop(world)
+    world.send(0xF1, 0x01, b"")
+    while True:
+        m, sub, payload = world.recv()
+        if (m, sub) == (4, 0x22):
+            break
+    while True:
+        m, sub, slot_info = world.recv()
+        if (m, sub) == (8, 0x0E):
+            break
+    capacities = {slot_info[1 + i * 4]:
+                  (struct.unpack_from("<H", slot_info, 2 + i * 4)[0], slot_info[4 + i * 4])
+                  for i in range(slot_info[0])}
+    assert capacities[5] == (48, 2) and capacities[6] == (60, 3), capacities
+    m, sub, bank_payload = world.recv()
+    assert (m, sub) == (8, 0x10)
+    bank_count = struct.unpack_from("<I", bank_payload, 0)[0]
+    bank_rows = [(bank_payload[4 + i * 118],
+                  struct.unpack_from("<H", bank_payload, 5 + i * 118)[0],
+                  struct.unpack_from("<I", bank_payload, 7 + i * 118)[0],
+                  struct.unpack_from("<Q", bank_payload, 11 + i * 118)[0],
+                  struct.unpack_from("<H", bank_payload, 19 + i * 118)[0])
+                 for i in range(bank_count)]
+    assert any(row[0] == 0x10 and row[3] == bank_serial for row in bank_rows), bank_rows
+    m, sub, zenny = world.recv()
+    assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", zenny)[0] == 0
+    errors = check_payloads(login.replies + game.replies + world.replies, emu)
+    assert not errors, f"client readers rejected fresh-login storage packets: {errors}"
+    print("[ok] account bank survives fresh login: item serial, Zenny, Normal/Costume capacities")
+    world.s.close()
+    game.s.close()
+    login.s.close()
 if __name__ == "__main__":
     main()

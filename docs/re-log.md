@@ -211,3 +211,83 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
 | C 4/0x06 (empty) is sent once the map has loaded | writer FUN_1805f4e00; real client log |
 | S 0x23/0x02 GESTURE_SLOT_LOAD: 6 x u32 quick slots, then FUN_180024940 (u8, u32, u8 n x u32, u8 n x u32), FUN_18001c100, FUN_180038a90 (u16-counted lists); empty lists = 73 B. Basic gestures = class*1000 + 0..5 (tb_Gesture: Hello, Laugh, Sad, Cheer, Sit, Dance) | handler FUN_180e2bd50; reader_check 73/73 err 0 |
 | C 9/0x20 -> S 9/0x20 SHOP_CASH_LOAD: u8 (1 = full load) + FUN_18000eb70 (u32 count + items); empty = 5 B. Unanswered = cash shop click crash | handler FUN_180e0b0c0; reader_check 5/5 err 0 |
+
+## Personal storage and Zenny — 2.3.34.7
+
+- C→S `MAIN_ITEM/0x10` requests bank information. The approved client’s
+  `FUN_180df4f30` routes persisted groups `0x16/0x17/0x18` to
+  `CharacterBankDialog`; the visible `BankDialog` map uses aliases
+  `0x10/0x11/0x12` (`FUN_1806d48f0`, selected-group path in `FUN_180dfd7c0`).
+- DB rows remain canonical `0x16/0x17/0x18`; the S→C `8/0x10` list encodes
+  them as `0x10/0x11/0x12` so relog uses the same model path as a live move.
+  C→S move aliases are normalized back to canonical groups before persistence.
+- C→S `MAIN_ITEM/0x24` sender `FUN_1805f70f0` emits exactly `u8 direction +
+  u64 amount` (9-byte payload). UI strings 0x9344–0x9347 and callbacks
+  `FUN_1806d3f90`/`FUN_1806d4150` establish direction 1 = Deposit Zenny and
+  direction 0 = Withdraw Zenny.
+- The server applies valid Zenny transfers atomically. It returns the updated
+  wallet in `8/0x20`, then bank capacities/items in `8/0x0E` and `8/0x10`,
+  followed by the persisted bank balance in S→C `8/0x21` as one u64.
+- Approved-client registration `0x180db4940` maps opcode `0x821` to handler
+  `0x180ddeff0`: it reads u64 via `0x18000e5e0` and calls `0x1806d80d0`,
+  which invokes the bank UI's `SetBankMoney`. The C→S `8/0x24` request has
+  no `8/0x24` reply; `8/0x21` is the balance update. `CHARACTER_INFO_RES`
+  field `+0x360` remains semantically unmapped and is not used for this fix.
+- E2E asserts `8/0x21` balance on open, after deposit, across a fresh
+  character-B login, after withdrawal and restoration. It verifies the shared
+  item serial in the reloaded `8/0x10` list using client-visible aliases.
+- PlayScene activation calls `FUN_180dae520`, which sends C→S `8/0x10`.
+  The server answers with `8/0x0E`, `8/0x10`, and `8/0x21`; list rows use
+  aliases `0x10/0x11/0x12` and retain their slots, IDs, serials, and counts.
+- C→S `CHANNEL_INFO_REQ F1/01` receives `4/0x22` then triggers `refresh_bank`
+  after map initialization. The fresh-character E2E verifies the same bank
+  item and balance after that late refresh. These are protocol/persistence
+  checks; they do not capture the client’s rendered UI.
+- Each `8/0x0E` entry is `u8 group, u16 capacity, u8 auxiliary`. The
+  slot-info contains two state families: UI slot groups 5/6/14
+  (Normal/Costume/Cash) and bank item-storage groups 0x16/0x17/0x18. Capacities
+  for both are sourced from persisted capacity keys 0x16/0x17/0x18. Initial
+  capacities are 24/48/384; UI auxiliary values are 0/2/30 and item-storage
+  auxiliary values are 0/0/0.
+- [INFERENCE] UI auxiliary values correspond to page counts via
+  `capacity / 12 - 2`: group 5 capacities 24/36/48 map to 0/1/2, and groups
+  6/14 initial capacities 48/384 map to 2/30. Disassembly establishes that
+  auxiliary+2 is stored and the UI maxima are 2/4/32; no live UI/render
+  predicate confirming these bytes unlock rows has been verified.
+- E2E asserts packet bytes, bank-list aliases, account persistence, and
+  cross-character reload; actual UI rendering and row-unlock behavior remain
+  unverified.
+- Bank rows persist under `0x16/0x17/0x18`; move requests/replies use client
+  aliases `0x10/0x11/0x12`; the `8/0x10` bank-info list uses those aliases for
+  the visible `BankDialog` model. Ordinary bag groups remain unchanged.
+- C→S `8/0x25` sorts the selected account-bank model group. Requests may use
+  selected UI groups `5/6/14` or bank aliases `0x10/0x11/0x12`; both resolve
+  to canonical DB storage groups `22/23/24` (`0x16/0x17/0x18`). The S→C
+  `8/0x25` header and each returned row echo the selected/requested group so
+  the selected BankDialog view refreshes. Sorting packs rows by
+  `(item_id, serial)` into slots `0..n-1`. The DB rows are account-owned and
+  shared across characters; sorting does not cross accounts or storage groups.
+- Add Slots C→S `8/0x0F` carries a mode byte: `0` Normal, `1` Costume,
+  `2` Cash (unsupported). It consumes one item 837000002 per accepted use and
+  grows that bank by 12. The Desktop client's `tb_Bank_Slot_Extend.res` table
+  encodes +12-slot options and one `837000002` card per expansion. This client
+  table observation is from `C:\Users\Michael\Desktop\SW`; do not infer that
+  the server-side table is independently verified by a live UI interaction.
+  The parsed row is `(level, Normal item, count, target capacity, Costume item,
+  count, target capacity)`. [INFERENCE] `level` orders option rows, and the
+  bank's item/count/capacity triple specifies qualifying consumable and result;
+  the handler selects the target current capacity + 12. Normal and Costume cap
+  at 384; zero-valued Costume options above that target remain unselectable.
+  S→C emits item update `8/0x15`, then `8/0x0F` `{mode, auxiliary, capacity}`,
+  slot-info `8/0x0E`, then bank items `8/0x10`. [INFERENCE] Auxiliary follows
+  `capacity / 12 - 2`, consistent with current slot-info metadata.
+  E2E checks both modes, one-card consumption, and a fresh-login second
+  character observing the shared bank item serial, Zenny and capacities while
+  retaining a private wallet. Packet/UI metadata is checked; visual rendering
+  or row unlocking is not verified.
+- Item-use C→S `8/0x11` retains item 6001026 for Normal storage, adding 12
+  slots per use up to 48 (E2E covers 36→48).
+- Bank stack E2E uses a valid stackable potion in isolated bank storage, splits
+  it into an empty aliased bank slot, checks the split and combine response
+  groups plus slot/count/serial conservation, then returns and discards the
+  restored stack. This is protocol coverage, not a claim about rendered UI.

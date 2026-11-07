@@ -35,10 +35,12 @@ def load_tables():
     z = zipfile.ZipFile(io.BytesIO(raw.translate(bytes(b ^ 0x55 for b in range(256)))))
     key = pw["data11"].encode("latin1")
     read = lambda n: z.read("../bin/Table/" + n, pwd=key)
+    optional = lambda n: read(n) if "../bin/Table/" + n in z.namelist() else None
     return (read("tb_Character_Info.res"), read("tb_Create_Cloth.res"), read("tb_Item.res"),
             read("tb_CashShop.res"), read("tb_CashBilling_Info.res"), read("tb_Item_Package.res"),
             read("tb_Item_Classify.res"), read("tb_NPC.res"), read("tb_Quest_Episode.res"),
-            read("tb_Shop.res"), read("tb_Skill.res"))
+            read("tb_Shop.res"), read("tb_Skill.res"),
+            optional("tb_Bank_Slot_Extend.res"))
 
 
 def quest_bits(b):
@@ -139,7 +141,44 @@ def parse_classify(b):
             o += 2 + ln * 2
         o += 2
         out[rid] = (inven, slot)
+
+
     assert len(b) - o < 64, f"tb_Item_Classify layout drift: {len(b) - o} bytes left"
+    return out
+
+def parse_bank_slot_extend(b):
+    """Decode tb_Bank_Slot_Extend's 20-byte rows and 34-byte table trailer."""
+    if b is None:
+        return []
+    assert len(b) >= 4, "truncated tb_Bank_Slot_Extend header"
+    n = struct.unpack_from("<I", b)[0]
+    row_size, trailer_size = 20, 34
+    assert len(b) == 4 + n * row_size + trailer_size, (
+        f"invalid tb_Bank_Slot_Extend size: {len(b)} for {n} rows"
+    )
+    out = []
+    previous_level = 0
+    for i in range(n):
+        o = 4 + i * row_size
+        level, index, flags, normal_flags = struct.unpack_from("<4B", b, o)
+        normal_item, = struct.unpack_from("<I", b, o + 4)
+        normal_increment, normal_capacity = struct.unpack_from("<BH", b, o + 8)
+        costume_enabled, costume_flags = struct.unpack_from("<BB", b, o + 11)
+        costume_item, = struct.unpack_from("<I", b, o + 13)
+        costume_increment, costume_capacity = struct.unpack_from("<BH", b, o + 17)
+        assert level == i + 1 and index == level and flags == 1, (
+            f"invalid tb_Bank_Slot_Extend row {i + 1}"
+        )
+        assert level > previous_level
+        previous_level = level
+        assert normal_flags == 3
+        assert (costume_enabled, costume_flags) in ((1, 3), (0, 0))
+        assert normal_item and normal_increment and normal_capacity
+        assert ((costume_item, costume_increment, costume_capacity) != (0, 0, 0)
+                if costume_enabled else
+                (costume_item, costume_increment, costume_capacity) == (0, 0, 0))
+        out.append((level, normal_item, normal_increment, normal_capacity,
+                    costume_item, costume_increment, costume_capacity))
     return out
 
 
@@ -324,8 +363,9 @@ def item_ids(b):
 
 
 def main():
-    (info, cloth, items, shop, billing, package, classify_raw, npc_tab, episodes, npc_shop_raw,
-     skill_tab) = load_tables()
+    (info, cloth, items, shop, billing, package, classify_raw, npc_tab,
+     episodes, npc_shop_raw, skill_tab, bank_slot_extend_raw) = load_tables()
+    bank_slot_extend = parse_bank_slot_extend(bank_slot_extend_raw)
     cloth_rows = parse_cloth(cloth)
     starts = parse_class_starts(info, set(cloth_rows))
     # Fixed date so --check is reproducible; regenerate to refresh the shop.
@@ -766,6 +806,16 @@ def main():
         "pub const NAVMESH: &[(u16, &[[f32; 2]], &[&[u16]])] = &[",
     ] + nav_lines + ["];", ""]
     print(f"navmesh: {nav_maps} of {len(maze_data.KEY_MAPS)} maze maps")
+    lines += [
+        "/// tb_Bank_Slot_Extend: (level, Normal item, slot increment, target capacity,",
+        "/// Costume item, slot increment, target capacity).",
+        "pub const BANK_SLOT_EXTEND: &[(u8, u32, u8, u16, u32, u8, u16)] = &[",
+    ]
+    for level, normal_item, normal_increment, normal_capacity, costume_item, costume_increment, costume_capacity in bank_slot_extend:
+        lines.append(
+            f"    ({level}, {normal_item}, {normal_increment}, {normal_capacity}, "
+            f"{costume_item}, {costume_increment}, {costume_capacity}),")
+    lines += ["];",""]
     hdr = max(i for i, l in enumerate(lines[:12]) if l.startswith("//!")) + 1
     lines.insert(hdr, "\n/// One monster AI script (see AIS).\n#[derive(Debug)]\npub struct AiDef {\n    pub check_ms: u32,\n    pub select_ms: (u32, u32),\n    pub attack_ms: (u32, u32),\n    pub keep: (u32, u32),\n    pub groups: &'static [&'static [u8]],\n    pub picks: &'static [(u8, &'static [(u8, u8, i32)])],\n    pub slots: &'static [(u8, u8, &'static [(u8, u8, i32)])],\n}\n")
     text = "\n".join(lines)
