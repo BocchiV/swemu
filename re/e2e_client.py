@@ -125,6 +125,7 @@ def main():
     # (exact name; use a fresh test DB) and expect GM commands to work.
     gm_user = argv[argv.index("--gm-user") + 1] if "--gm-user" in argv else None
     gm_expected = gm_user is not None
+    cash_shop_only = "--cash-shop-only" in argv
     user = gm_user or "e2e_" + os.urandom(3).hex()
     mac = "0A-1B-2C-3D-4E-5F"
 
@@ -359,21 +360,36 @@ def main():
     w3.send(9, 0x20, b"")
     assert recv_cash_shop(w3)[0] == shop_items
     print("[ok] SHOP_CASH_LOAD 9/0x20 on click answered with the same catalogue")
-    # shop 23964 = box 6000451 for 1000 cash; option 0, quantity 1 (real client capture)
+    # A bad later line must not partially charge or deliver the valid first line.
     cash_before = last_cash
-    w3.send(9, 0x21, struct.pack("<IIBHB", 1, 23964, 0, 1, 0))
+    w3.send(9, 0x21, struct.pack("<IIBHIBHB", 2, 23964, 0, 1, 0xFFFFFFFF, 0, 1, 0))
+    m, sub, p = w3.recv()
+    assert (m, sub) == (9, 0x21), (m, sub)
+    m, sub, p = w3.recv()
+    assert (m, sub) == (8, 0x01), (m, sub)
+    n = struct.unpack_from("<I", p, 0)[0]
+    inv = [(p[4 + i * 118], struct.unpack_from("<I", p, 4 + i * 118 + 3)[0]) for i in range(n)]
+    assert not any(item in (6000451, 6000452) for _, item in inv), inv
+    m, sub, p = w3.recv()
+    assert (m, sub) == (8, 0x33) and struct.unpack_from("<I", p, 0)[0] == cash_before, (m, sub, p, cash_before)
+    print("[ok] invalid multi-line SHOP_CASH_BUY rejected without partial charge or delivery")
+
+    # Products 23964/23965 each cost 1000 cash and grant boxes 6000451/6000452.
+    w3.send(9, 0x21, struct.pack("<IIBHIBHB", 2, 23964, 0, 1, 23965, 0, 1, 0))
     m, sub, p = w3.recv()
     assert (m, sub) == (9, 0x21), (m, sub)
     m, sub, p = w3.recv()
     assert (m, sub) == (8, 0x01), (m, sub)
     n = struct.unpack_from("<I", p, 0)[0]
     inv = [(p[4 + i * 118], struct.unpack_from("<I", p, 4 + i * 118 + 3)[0], struct.unpack_from("<Q", p, 4 + i * 118 + 7)[0]) for i in range(n)]
+    boxes = {(x[0], x[1]) for x in inv if x[1] in (6000451, 6000452)}
+    assert boxes == {(0x0D, 6000451), (0x0D, 6000452)}, inv
     box = [x for x in inv if x[1] == 6000451]
-    assert box and box[0][0] == 0x0D, inv
     m, sub, p = w3.recv()
     cash_after = struct.unpack_from("<I", p, 0)[0]
-    assert (m, sub) == (8, 0x33) and cash_after == cash_before - 1000, (m, sub, cash_before, cash_after)
-    print(f"[ok] SHOP_CASH_BUY: box 6000451 in the cash bag, cash {cash_before} -> {cash_after}")
+    assert (m, sub) == (8, 0x33) and cash_after == cash_before - 2000, (m, sub, cash_before, cash_after)
+    print(f"[ok] multi-line SHOP_CASH_BUY: boxes 6000451/6000452 delivered, cash {cash_before} -> {cash_after}")
+
     serial = box[0][2]
     w3.send(8, 0x11, struct.pack("<BHQB", 0x0D, 0, serial, 1))
     m, sub, p = w3.recv()
@@ -383,8 +399,17 @@ def main():
     assert (6000451, 0) in upd and (213881001, 1) in upd, upd
     m, sub, p = w3.recv()
     assert (m, sub) == (8, 0x11) and struct.unpack_from("<I", p, 0)[0] == 6000451, (m, sub, p[:4])
-    print("[ok] ITEM_USE 8/0x11 opened the box: ITEM_UPDATE 8/0x15 removes it and adds costume 213881001")
+    m, sub, p = w3.recv()
+    assert (m, sub) == (8, 0x01), (m, sub)
+    n = struct.unpack_from("<I", p, 0)[0]
+    snapshot = [(p[4 + i * 118], struct.unpack_from("<I", p, 4 + i * 118 + 3)[0], struct.unpack_from("<H", p, 4 + i * 118 + 15)[0]) for i in range(n)]
+    assert (4, 213881001, 1) in snapshot, snapshot
+    print("[ok] ITEM_USE package delta + reply + full inventory snapshot contain costume 213881001")
     cos = [u for u in [(p2[4 + i * 118], struct.unpack_from("<H", p2, 4 + i * 118 + 1)[0], struct.unpack_from("<I", p2, 4 + i * 118 + 3)[0]) for i in range(struct.unpack_from("<I", p2, 0)[0])] if u[2] == 213881001][0]
+    if cash_shop_only and not gm_expected:
+        print("CASH SHOP E2E OK")
+        return
+
     # equip: real client capture shape (costume bag -> shape slot 7)
     w3.send(8, 0x02, struct.pack("<BIHBBIHB", cos[0], 213881001, cos[1], 0, 0, 213881001, 7, 0))
     m, sub, p = w3.recv()
@@ -419,6 +444,40 @@ def main():
         m, sub, p = w3.recv()
         assert (m, sub) == (7, 0x01), (m, sub)
         print("[ok] GM 7/0x0A '/item 6000451 2' -> ITEM_UPDATE + [GM] chat reply")
+        # The Wings of Purity costume must be visible in the immediate full snapshot.
+        wings = "/item 6101120 1".encode("utf-16-le")
+        w3.send(7, 0x0A, struct.pack("<H", len(wings)) + wings)
+        m, sub, p = w3.recv()
+        assert (m, sub) == (8, 0x15), (m, sub)
+        n = struct.unpack_from("<I", p, 0)[0]
+        grant = [(p[4 + i * 118], struct.unpack_from("<H", p, 4 + i * 118 + 1)[0],
+                  struct.unpack_from("<I", p, 4 + i * 118 + 3)[0],
+                  struct.unpack_from("<Q", p, 4 + i * 118 + 7)[0],
+                  struct.unpack_from("<H", p, 4 + i * 118 + 15)[0]) for i in range(n)]
+        wings_box = [item for item in grant if item[2] == 6101120]
+        assert len(wings_box) == 1 and wings_box[0][0] == 0x0D and wings_box[0][4] == 1, grant
+        m, sub, p = w3.recv()
+        assert (m, sub) == (7, 0x01), (m, sub)
+        storage, slot, _, serial, _ = wings_box[0]
+        w3.send(8, 0x11, struct.pack("<BHQB", storage, slot, serial, 1))
+        m, sub, p = w3.recv()
+        assert (m, sub) == (8, 0x15), (m, sub)
+        n = struct.unpack_from("<I", p, 0)[0]
+        updates = [(p[4 + i * 118], struct.unpack_from("<I", p, 4 + i * 118 + 3)[0],
+                    struct.unpack_from("<H", p, 4 + i * 118 + 15)[0]) for i in range(n)]
+        assert (0x0D, 6101120, 0) in updates and (4, 213881007, 1) in updates, updates
+        m, sub, p = w3.recv()
+        assert (m, sub) == (8, 0x11) and struct.unpack_from("<I", p, 0)[0] == 6101120, (m, sub, p[:4])
+        m, sub, p = w3.recv()
+        assert (m, sub) == (8, 0x01), (m, sub)
+        n = struct.unpack_from("<I", p, 0)[0]
+        snapshot = [(p[4 + i * 118], struct.unpack_from("<I", p, 4 + i * 118 + 3)[0],
+                    struct.unpack_from("<H", p, 4 + i * 118 + 15)[0]) for i in range(n)]
+        assert (4, 213881007, 1) in snapshot, snapshot
+        print("[ok] Wings of Purity 6101120: costume 213881007 is visible immediately in storage 4")
+        if cash_shop_only:
+            print("CASH SHOP AND WINGS E2E OK")
+            return
     else:
         w3.send(1, 0x06, struct.pack("<QQI", 0x77, 0, 0))
         m, sub, p = w3.recv()
