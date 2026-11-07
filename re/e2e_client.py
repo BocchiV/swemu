@@ -138,6 +138,8 @@ def main():
     position_failure_only = "--position-failure-only" in argv
     test_db_path = argv[argv.index("--test-db-path") + 1] if "--test-db-path" in argv else None
     assert not (position_persistence_only and position_failure_only), "choose only one position mode"
+    if position_persistence_only:
+        assert gm_user, "--position-persistence-only requires --gm-user"
     if position_failure_only:
         assert gm_user and test_db_path, "--position-failure-only requires --gm-user and --test-db-path"
     user = gm_user or "e2e_" + os.urandom(3).hex()

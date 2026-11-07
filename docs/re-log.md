@@ -193,9 +193,9 @@ characters start without a saved location. SELECT_CHARACTER then sends the saved
 the existing world ticket and CHARACTER_INFO_RES spawn path, or uses `start_spot()` when no
 location exists. The initial spawn position is installed after maze reset so an immediate
 explicit logout has a valid location to save.
-`re/e2e_client.py --position-persistence-only` exercises the start fallback,
-immediate town logout, moved XYZ, and saved Spot restoration on map 21211, then
-returns before monster/drop/AI scenarios.
+Run `python re/e2e_client.py --gm-user <GM_ACCOUNT> --position-persistence-only`;
+it exercises the start fallback, immediate town logout, moved XYZ, and saved Spot
+restoration on map 21211, then returns before monster/drop/AI scenarios.
 The DB-failure regression mode uses a separate isolated database path:
 
 ```text
