@@ -40,6 +40,21 @@ pub struct Config {
     /// Zenny (game money) a new character starts with.
     #[serde(default = "default_start_zenny")]
     pub start_zenny: u64,
+    /// EXP multiplier for monster kills, maze clears and quest rewards
+    /// (1 = client table values; 0 is treated as 1).
+    pub exp_rate: u32,
+    /// Refuse maze entry below the maze's Req_Min_Lv (MSG_ENTER_LEVEL).
+    /// Off lets any level enter any maze (test servers).
+    pub maze_level_gate: bool,
+    /// Report every story maze (episodes 1..5) as cleared in MAZE_CLEAR_INFO
+    /// 17/0x64, so the maze list shows all of them open. Off reports only
+    /// the mazes the character really cleared.
+    pub unlock_all_mazes: bool,
+    /// New characters (level 1, no quest) start the tutorial chain in the
+    /// tutorial maze 21111. Off (default) puts them in town with the tutorial
+    /// skipped: the client does not let the player move in T01_TUTORIAL yet
+    /// (its tutorial script waits for a step the server does not send).
+    pub tutorial_start: bool,
 }
 
 fn default_start_zenny() -> u64 {
@@ -66,11 +81,25 @@ impl Default for Config {
             start_cash: 999_999_999,
             gm_accounts: Vec::new(),
             start_zenny: default_start_zenny(),
+            exp_rate: 1,
+            maze_level_gate: true,
+            unlock_all_mazes: false,
+            tutorial_start: false,
         }
     }
 }
 
 impl Config {
+    /// `exp_rate` with 0 read as 1.
+    pub fn exp_multiplier(&self) -> u32 {
+        self.exp_rate.max(1)
+    }
+
+    /// `exp` scaled by `exp_rate`, saturating at u32::MAX.
+    pub fn scale_exp(&self, exp: u32) -> u32 {
+        exp.saturating_mul(self.exp_multiplier())
+    }
+
     pub fn load_or_default(path: &str) -> anyhow::Result<Self> {
         let mut c = match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s)?,
@@ -134,6 +163,17 @@ mod tests {
         assert!(!client_accepts_login_ip("127.0.0.1"));
         assert!(!client_accepts_login_ip("10.0.0.2"));
         assert!(!client_accepts_login_ip("172.31.0.1"));
+    }
+
+    #[test]
+    fn new_keys_default_to_the_old_behaviour() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!((c.exp_rate, c.maze_level_gate, c.unlock_all_mazes), (1, true, false));
+        let c: Config = serde_json::from_str(r#"{"exp_rate": 10, "maze_level_gate": false, "unlock_all_mazes": true}"#).unwrap();
+        assert_eq!(c.scale_exp(604), 6040);
+        assert_eq!(c.scale_exp(u32::MAX), u32::MAX);
+        assert!(!c.maze_level_gate && c.unlock_all_mazes);
+        assert_eq!(Config { exp_rate: 0, ..Config::default() }.scale_exp(7), 7);
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod handlers;
 mod http;
 mod maze;
 mod proto;
+mod quest;
 mod session;
 mod vfun;
 mod wire;

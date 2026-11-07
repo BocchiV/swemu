@@ -48,8 +48,26 @@ READERS = {
     (6, 0x07): ([("cur", 0x18000e580)], 0x40, "SKILL_PASSIVE"),
     # QUEST_COMPLETE_LIST: FUN_18000e290(cursor, buf, 0x100) = 256 raw bytes.
     (0x15, 0x01): ([("cur256", 0x18000e290)], 0x200, "QUEST_COMPLETE_LIST"),
-    # QUEST_LIST: FUN_180038d70 + FUN_180038f00 (empty = 4 bytes).
-    (0x15, 0x02): ([("pkt", 0x180038d70), ("pkt", 0x180038f00)], 0x2000, "QUEST_LIST"),
+    # QUEST_LIST (handler FUN_180e14bb0): FUN_180038d70 into the std::map built
+    # by FUN_180e51cf0, then FUN_180038f00 into the map built by FUN_180e54220
+    # (both insert into the map, so the constructors must run first; empty = 4 B).
+    (0x15, 0x02): ([("pkt", 0x180038d70, 0x180e51cf0), ("pkt", 0x180038f00, 0x180e54220)], 0x2000, "QUEST_LIST"),
+    # Quest replies (handlers FUN_180e15050 .. FUN_180e164c0, PlayScene table).
+    # QUEST_ACCEPT: u32 episode, u8 show helper, FUN_180038bd0 {u32, u64, u8}.
+    (0x15, 0x03): ([("cur", 0x18000e5b0), ("cur", 0x180010900), ("pkt", 0x180038bd0)], 0x400, "QUEST_ACCEPT"),
+    # QUEST_EPISODE_COMPLETE: FUN_180020fb0 (7 x u32, u8 n x {u32, u16, u8},
+    # 3 x u32) then FUN_180038bd0.
+    (0x15, 0x05): ([("pkt", 0x180020fb0), ("pkt", 0x180038bd0)], 0x4000, "QUEST_EPISODE_COMPLETE"),
+    (0x15, 0x06): ([("cur", 0x18000e5b0)], 0x40, "QUEST_GIVE_UP"),
+    # QUEST_UPDATE: FUN_180038a90 = i16 n x {u32 condition, u8 step}.
+    (0x15, 0x07): ([("pkt", 0x180038a90)], 0x400, "QUEST_UPDATE"),
+    # QUEST_EVENT_UPDATE reply: handler FUN_180e160f0 reads nothing.
+    (0x15, 0x08): ([], 0x40, "QUEST_EVENT_UPDATE"),
+    (0x15, 0x09): ([("cur", 0x180010900), ("cur", 0x18000e5b0)], 0x40, "QUEST_HELPER"),
+    (0x15, 0x11): ([("pkt", 0x18004d4f0)], 0x40, "QUEST_FAIL"),
+    # MAZE_CLEAR_INFO 17/0x64 (handler FUN_180e06040): FUN_180049ac0 into the
+    # std::map built by FUN_180e521f0.
+    (0x11, 0x64): ([("pkt", 0x180049ac0, 0x180e521f0)], 0x400, "MAZE_CLEAR_INFO"),
     # SYSTEM_PING reply: PlayScene handler FUN_180decc20, one u64 (FUN_18000e5e0).
     (1, 0x06): ([("cur", 0x18000e5e0)], 0x10, "SYSTEM_PING"),
     # GESTURE_SLOT_LOAD: PlayScene handler FUN_180e2bd50 runs four readers in order.
@@ -201,8 +219,18 @@ def run_reader(emu, main, sub, payload):
     out = emu.alloc(out_size)
     if isinstance(addr, list):
         # Inline handler: replay its reads in order. "cur" helpers take the
-        # cursor (pkt+0xb), "pkt" readers take (pkt, out).
-        for kind, fn in addr:
+        # cursor (pkt+0xb), "pkt" readers take (pkt, out). A third element is
+        # the constructor the handler runs on that reader's own output object
+        # first (e.g. an MSVC std::map the reader inserts into); such a reader
+        # gets a fresh output buffer.
+        for step in addr:
+            kind, fn = step[0], step[1]
+            if len(step) > 2:
+                obj = emu.alloc(out_size)
+                dummy = emu.alloc(0x10)
+                emu.call(step[2], obj, dummy, dummy + 8)
+                emu.call(fn, p, obj)
+                continue
             if kind == "cur":
                 emu.call(fn, p + 0x0B)
             elif kind == "wstr":  # FUN_18000e4b0(cursor, buf, max units, &len)

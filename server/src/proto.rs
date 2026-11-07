@@ -1141,6 +1141,8 @@ pub enum GmCommand {
     Heal,
     /// /god: toggle invulnerability (monsters still attack, no HP loss).
     God,
+    /// /questcomplete <episode>: complete an episode with its rewards.
+    QuestComplete(u32),
     Help,
     Unknown(String),
 }
@@ -1172,6 +1174,7 @@ pub fn parse_gm_line(line: &str) -> GmCommand {
         ("die", _) | ("suicide", _) => GmCommand::Die,
         ("heal", _) | ("hpfull", _) => GmCommand::Heal,
         ("god", _) | ("invincible", _) => GmCommand::God,
+        ("questcomplete", [ep]) | ("qc", [ep]) if *ep <= u64::from(u32::MAX) => GmCommand::QuestComplete(*ep as u32),
         ("help", _) | ("gm", _) => GmCommand::Help,
         _ => GmCommand::Unknown(line.to_string()),
     }
@@ -1198,20 +1201,146 @@ pub fn quest_complete_bits(bits: impl IntoIterator<Item = u16>) -> [u8; QUEST_CO
     done
 }
 
-/// Until quest progress exists, the story episodes that gate town NPCs
-/// (Trisha, Janice, Eo — tb_NPC show condition) count as completed.
-pub fn default_completed_episodes() -> [u8; QUEST_COMPLETE_BYTES] {
-    quest_complete_bits(gamedata::NPC_UNLOCK_EPISODES.iter().map(|e| e.1))
-}
-
 /// QUEST_LIST 21/0x02 — handler FUN_180e14bb0: readers FUN_180038d70 +
 /// FUN_180038f00; the empty list is 4 bytes (two empty i16 counts, checked
 /// under Unicorn). Sets PlayScene flag +0x10c8 bit 1.
 ///
 /// The PlayScene tick FUN_180466740 only spawns NPCs queued by 4/0x22 while
 /// one of these flag bits is set: without both quest packets NPCs never show.
+#[cfg(test)]
 pub fn quest_list_empty() -> Vec<u8> {
     vec![0; 4]
+}
+
+/// Condition slots per quest episode (tb_Quest_Episode, QUEST_LIST entry).
+pub const QUEST_CONDITION_SLOTS: usize = 10;
+
+/// One QUEST_LIST entry (reader FUN_180038d70, checked under Unicorn): u32
+/// episode, u8 quest helper pinned, u16 mask of finished condition slots, u8
+/// failed, then 10 x {u32 condition id, u8 step} (OpenWorker QuestInfoEntry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestEntry {
+    pub episode: u32,
+    pub helper: bool,
+    pub done_mask: u16,
+    pub failed: bool,
+    pub conditions: [(u32, u8); QUEST_CONDITION_SLOTS],
+}
+
+/// QUEST_LIST 21/0x02: i16 n + n entries, then the second reader's list
+/// (FUN_180038f00, i16 n) left empty.
+pub fn quest_list(entries: &[QuestEntry]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(entries.len() as u16);
+    for e in entries {
+        w.u32(e.episode).u8(e.helper as u8).u16(e.done_mask).u8(e.failed as u8);
+        for (cond, step) in e.conditions {
+            w.u32(cond).u8(step);
+        }
+    }
+    w.u16(0);
+    w.finish()
+}
+
+/// QUEST_ACCEPT 21/0x03 reply — handler FUN_180e15050: u32 episode, u8 show
+/// the quest helper, then FUN_180038bd0 {u32, u64, u8} (unused here, zero).
+pub fn quest_accept_res(episode: u32, show_helper: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(episode).u8(show_helper as u8).zeros(13);
+    w.finish()
+}
+
+/// What completing an episode granted (tb_Quest_Episode rewards).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuestReward {
+    pub exp: u32,
+    pub zenny: u32,
+    pub bp: u32,
+    pub ether: u32,
+    pub items: Vec<(u32, u16)>,
+}
+
+/// QUEST_EPISODE_COMPLETE 21/0x05 reply — handler FUN_180e154e0: reader
+/// FUN_180020fb0 = 7 x u32 (episode, EXP, Zenny, BP, ether, 2 x title),
+/// u8 n x {u32 item, u16 count, u8}, 3 x u32; then FUN_180038bd0 {u32, u64,
+/// u8}. Field order as OpenWorker QuestEpisodeCompleteResponse; the layout
+/// is the 2.3.34.7 reader's (checked under Unicorn).
+pub fn quest_episode_complete_res(episode: u32, r: &QuestReward) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(episode).u32(r.exp).u32(r.zenny).u32(r.bp).u32(r.ether).u32(0).u32(0);
+    let items = &r.items[..r.items.len().min(u8::MAX as usize)];
+    w.u8(items.len() as u8);
+    for &(item, count) in items {
+        w.u32(item).u16(count).u8(0);
+    }
+    w.zeros(12).zeros(13);
+    w.finish()
+}
+
+/// u32 episode echo: QUEST_GIVE_UP 21/0x06 (handler FUN_180e15b60, u32) and
+/// QUEST_FAIL 21/0x11 (handler FUN_180e164c0, FUN_18004d4f0 = u32).
+pub fn quest_episode_res(episode: u32) -> Vec<u8> {
+    episode.to_le_bytes().to_vec()
+}
+
+/// QUEST_UPDATE 21/0x07 — handler FUN_180e15d60, reader FUN_180038a90:
+/// i16 n x {u32 condition, u8 step} (OpenWorker QuestUpdateResponse).
+pub fn quest_update(changes: &[(u32, u8)]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(changes.len() as u16);
+    for &(cond, step) in changes {
+        w.u32(cond).u8(step);
+    }
+    w.finish()
+}
+
+/// QUEST_HELPER 21/0x09 reply — handler FUN_180e16120: u8 kind (0 remove,
+/// 1 add; OpenWorker QuestHelperType), u32 episode.
+pub fn quest_helper_res(add: bool, episode: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u8(add as u8).u32(episode);
+    w.finish()
+}
+
+/// QUEST_EVENT_UPDATE 21/0x08 request (OpenWorker QuestEventUpdateRequest):
+/// u32 episode, u32 condition, i64 parameter (0 = one step). The reply
+/// handler FUN_180e160f0 reads nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestEventReq {
+    pub episode: u32,
+    pub condition: u32,
+    pub param: i64,
+}
+
+impl QuestEventReq {
+    pub fn parse(p: &[u8]) -> Result<Self, ReadError> {
+        let mut r = Reader::new(p);
+        Ok(Self { episode: r.u32()?, condition: r.u32()?, param: r.u64().unwrap_or(0) as i64 })
+    }
+}
+
+/// QUEST_HELPER 21/0x09 request: u8 kind (1 add), u32 episode.
+pub fn parse_quest_helper(p: &[u8]) -> Option<(bool, u32)> {
+    let mut r = Reader::new(p);
+    Some((r.u8().ok()? == 1, r.u32().ok()?))
+}
+
+/// MAZE_CLEAR_INFO 17/0x64 — handler FUN_180e06040, reader FUN_180049ac0
+/// into a std::map: u8 n x {u32 maze group, i16 k, k x u32 maze}, u32
+/// actor, u8 reset (PS_MAZE_CLEAR_INFO / ST_MAZE_CLEAR_INFO, sent by
+/// CGocRecode::UpdateClearInfo).
+pub fn maze_clear_info(groups: &[(u32, Vec<u32>)], actor: u32, reset: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    let groups = &groups[..groups.len().min(u8::MAX as usize)];
+    w.u8(groups.len() as u8);
+    for (group, mazes) in groups {
+        w.u32(*group).u16(mazes.len() as u16);
+        for &m in mazes {
+            w.u32(m);
+        }
+    }
+    w.u32(actor).u8(reset as u8);
+    w.finish()
 }
 
 #[cfg(test)]
@@ -1240,12 +1369,15 @@ mod ai_tests {
         assert!(gamedata::NAVMESH.len() > 300);
         let scripted = gamedata::MONSTER_AI.iter().filter(|m| m.1 != u16::MAX).count();
         assert!(scripted > 3000, "{scripted}");
-        // Spawn steps: CZ43 boxes 40291/40292 (Howler Very Hard) are step 2.
+        // CZ43 boxes 40291-40293 (Howler / Dredd Very Hard, step 2) sit on
+        // the Expert / VeryHard layers no maze turns on: Normal CZ43 has one
+        // step. Steps elsewhere: maze 53 sector 10001 releases 40121.. at 2.
         let load = trigger_boxes(21211, None);
         assert!(!load.contains(&40291) && !load.contains(&40292) && load.contains(&40111));
-        assert_eq!(step_boxes(21211, 10001, 2), vec![40291, 40292]);
-        assert_eq!(step_ratio(21211, 10001, 1), 100);
-        assert_eq!(max_step(21211, 10001), 2);
+        assert!(!gamedata::MAZE_SPAWNS.iter().any(|r| r.0 == 21211 && r.1 == 40291) && !gamedata::MAZE_SPAWNS.iter().any(|r| r.0 == 21211 && r.1 == 40293));
+        assert_eq!(max_step(21211, 10001), 1);
+        assert!(step_boxes(53, 10001, 2).contains(&40121));
+        assert!(max_step(53, 10001) >= 2);
         // 3/0x34 player HP also lives in the u64.
         let p = stat_list(1, &[(stat::HP_MAX, 900.0), (stat::HP_CUR, 450.0)]);
         assert_eq!(u64::from_le_bytes(p[11..19].try_into().unwrap()), 900);
@@ -1254,15 +1386,15 @@ mod ai_tests {
         let p = monster_stat(0x4000_0001, 1234, 5000);
         assert_eq!(u64::from_le_bytes(p[11..19].try_into().unwrap()), 5000);
         assert_eq!(u64::from_le_bytes(p[25..33].try_into().unwrap()), 1234);
-        // The step-2 Howler pair (21 units apart, radius 120) is pushed apart.
+        // Two monsters on one point are pushed apart (80 % of their radii).
         let mut next = 0;
-        let mut pair = monsters_for_boxes(21211, &[40291, 40292], &mut next);
+        let mut pair = monsters_for_boxes(21211, &[40111, 40111], &mut next);
         assert_eq!(pair.len(), 2);
         for _ in 0..4 {
             separate(21211, &mut pair);
         }
         let d = ((pair[0].pos[0] - pair[1].pos[0]).powi(2) + (pair[0].pos[1] - pair[1].pos[1]).powi(2)).sqrt();
-        assert!(d >= 150.0, "{d}");
+        assert!(d >= (pair[0].radius + pair[1].radius) * 0.8 - 1.0 && d > 1.0, "{d}");
         assert!(pair.iter().all(|m| walkable(21211, m.pos[0], m.pos[1])));
         // Level cap from the client table, and EXP carries past 80.
         assert_eq!(max_level(), 100);
@@ -1270,6 +1402,93 @@ mod ai_tests {
         assert_eq!(add_exp(100, 0, u32::MAX).0, 100);
         assert!(matches!(parse_gm_line("/level 95"), GmCommand::Level(95)));
         assert!(matches!(parse_gm_line("/level 250"), GmCommand::Level(100)));
+    }
+
+    #[test]
+    fn skill_hits_carry_the_attack_event_trigger() {
+        // SP_GET_FINAL_PDEF base: class 1 at Lv.45 = ((2.5 + 1.25 x 44) x
+        // 0.5 + 2.5 + 8 x 44) x 2.5 = 958; that cuts a hit by ~30 %.
+        assert_eq!(player_pdef(1, 45), 958);
+        assert_eq!(player_pdef(10, 45), player_pdef(1, 45));
+        // Client ActionData: the trigger is the client's own attack event
+        // key (50 per animation block, file order; Stella measured live:
+        // B_N_Attack_01 201/202, B_N_Attack_03 351..354). Dhana's dash
+        // attack B_N_Attack_Dash_01 has one attack event at 450 ms.
+        assert_eq!(skill_frames(52011011), &[(201, 147), (202, 230)]);
+        assert_eq!(skill_frames(52013011), &[(351, 267), (352, 390), (353, 520), (354, 660)]);
+        assert_eq!(skill_frames(102110011), &[(551, 450)]);
+        assert_eq!(skill_frames(102090011).len(), 2);
+        // Monster skills from the model's ActionData (WildStone B_Skill_01).
+        assert_eq!(skill_frames(1302010020), &[(1, 950)]);
+        assert!(gamedata::SKILL_FRAMES.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(gamedata::SKILL_FRAMES.len() > 4000);
+        // AnimSpeed triggers shift the frames to wall-clock time: Dhana's
+        // B_N_Attack_01 plays 0.2..0.5 s at 1.5x, so melee_02 (sequence
+        // 0.5 s) lands at 0.4 s, before the next combo step starts.
+        assert_eq!(skill_frames(102011011), &[(51, 200), (52, 400)]);
+        assert_eq!(skill_frames(102012011), &[(101, 300), (102, 540), (103, 780)]);
+        // Hit areas (ActionData tagATTACK_RANGE): Dhana's first combo step
+        // reaches 3 m (240 deg fan); monster melee ~1.5-6 m, not the 4-9 m
+        // tb_Skill AI range. BoneCrasher resists light hits (defence 2).
+        assert_eq!(skill_reach(102011011), Some(300.0));
+        // Player hit sectors: Stella's 3rd combo step is an 11 deg beam to
+        // 25 m; a monster 10 m ahead is hit, one 10 m to the side is not.
+        // Client rot 90 faces +x.
+        assert_eq!(skill_cone(52013011), Some((2520.0, 11.0)));
+        assert!(in_skill_cone([0.0; 3], 90.0, 2520.0, 11.0, [1000.0, 0.0, 0.0], 60.0));
+        assert!(!in_skill_cone([0.0; 3], 90.0, 2520.0, 11.0, [0.0, 1000.0, 0.0], 60.0));
+        assert!(!in_skill_cone([0.0; 3], 90.0, 2520.0, 11.0, [-1000.0, 0.0, 0.0], 60.0));
+        // Per-event areas (IsAttackDecision): Stella's 3rd combo hit is a
+        // 9 deg sector whose apex sits 18.5 m behind her, ring 17.7..21 m:
+        // a strip from ~0.8 m behind to 2.5 m in front. Facing +x (rot 90).
+        let a = skill_area(52013011, 351).unwrap();
+        assert_eq!(a, (1850.0, 1770.0, 2100.0, 9.0, true));
+        let ar = (a.0, a.1, a.2, a.3);
+        assert!(in_attack_area([0.0; 3], 90.0, ar, [150.0, 0.0, 0.0], 50.0));
+        assert!(!in_attack_area([0.0; 3], 90.0, ar, [600.0, 0.0, 0.0], 50.0));
+        assert!(!in_attack_area([0.0; 3], 90.0, ar, [100.0, 400.0, 0.0], 50.0));
+        // Stella's 1st hit: apex 5.3 m behind, 4.5..8.5 m, 45 deg.
+        let a = skill_area(52011011, 201).unwrap();
+        assert!(in_attack_area([0.0; 3], 90.0, (a.0, a.1, a.2, a.3), [250.0, 0.0, 0.0], 50.0));
+        assert!(!in_attack_area([0.0; 3], 90.0, (a.0, a.1, a.2, a.3), [-300.0, 0.0, 0.0], 50.0));
+        // Dhana's 240 deg fan (rot 0 faces -y) covers the sides, not the back.
+        assert!(in_skill_cone([0.0; 3], 0.0, 300.0, 240.0, [250.0, 0.0, 0.0], 60.0));
+        assert!(!in_skill_cone([0.0; 3], 0.0, 300.0, 240.0, [0.0, 250.0, 0.0], 60.0));
+        assert!(skill_reach(1302010020).is_some_and(|r| r < 300.0));
+        assert_eq!(monster_defence(30901106), 2);
+        assert_eq!(monster_defence(30901102), 0);
+        assert!(gamedata::SKILL_REACH.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(gamedata::MONSTER_DEFENCE.windows(2).all(|w| w[0].0 < w[1].0));
+        // The trigger goes to the action block (+0x1c after the list); hit
+        // part (+55 in the entry) is 0 (body), not 4.
+        let req = ActiveSkillReq { skill: 102110011, pos: [1.0, 2.0, 3.0], rot: 0.0 };
+        let p = action_skill_bt(3, &req, &[Hit { actor: 0x4000_0001, damage: 10, hp: 5 }], 2, 58);
+        let block = 1 + 60;
+        assert_eq!(p[1 + 55], 0);
+        assert_eq!(u32::from_le_bytes(p[block + 24..block + 28].try_into().unwrap()), 102110011);
+        assert_eq!(u16::from_le_bytes(p[block + 28..block + 30].try_into().unwrap()), 58);
+        assert_eq!(u16::from_le_bytes(p[block + 30..block + 32].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn gb_only_monsters_have_level_ai_and_own_skills() {
+        // Tower of Lord 28111: GB-only monsters (no row). They spawned as
+        // level 1 / 96 HP without AI, so every hit killed them before the HP
+        // bar showed. Now: the maze's level, the GB row's own AI script and
+        // skill slots (GB tb_Monster), HP derived from that level.
+        let mut next = 0;
+        let mons = monsters_for_boxes(28111, &[40101, 40102, 40103], &mut next);
+        assert_eq!(mons.len(), 3);
+        for m in &mons {
+            assert_eq!(m.level, 45, "{}", m.id);
+            assert!(m.max_hp > 5000, "{} {}", m.id, m.max_hp);
+            assert_ne!(monster_ai(m.id).0, None, "{} has no AI", m.id);
+        }
+        assert_eq!(monster_ai(30901102).1[0], 1302010020);
+        assert_eq!(monster_ai(30901101).1[0], 1301020010);
+        let spawned: std::collections::BTreeSet<u32> = gamedata::MAZE_SPAWNS.iter().flat_map(|s| s.3.iter().copied()).collect();
+        let with_ai = spawned.iter().filter(|&&id| gamedata::MONSTER_AI.iter().any(|a| a.0 == id)).count();
+        assert!(with_ai * 100 >= spawned.len() * 98, "{with_ai} of {}", spawned.len());
     }
 }
 
@@ -1325,7 +1544,7 @@ mod shop_tests {
         assert_eq!(world_monsters(&more).len(), 2 + 2 * 123);
         assert_eq!(active_skill_res().len(), 27);
         let req = ActiveSkillReq { skill: 1, pos: [0.0; 3], rot: 0.0 };
-        assert_eq!(action_skill_bt(1, &req, &[Hit { actor: 2, damage: 5, hp: 1 }], 1).len(), 1 + 60 + 34);
+        assert_eq!(action_skill_bt(1, &req, &[Hit { actor: 2, damage: 5, hp: 1 }], 1, 0).len(), 1 + 60 + 34);
         assert_eq!(parse_pre_targets(&[2, 1, 0, 0, 0x40, 2, 0, 0, 0x40]), vec![0x4000_0001, 0x4000_0002]);
         // Drops: Howler (rank 4) has 100 % gold.
         let mut seed = 7u32;
@@ -1370,6 +1589,30 @@ mod quest_bit_tests {
     use super::*;
 
     #[test]
+    fn quest_packets_have_the_reader_sizes() {
+        let e = QuestEntry { episode: 100020, helper: true, done_mask: 1, failed: false, conditions: [(1000201, 1); 10] };
+        let l = quest_list(&[e.clone(), e]);
+        assert_eq!(l.len(), 2 + 2 * 58 + 2);
+        assert_eq!(&l[2..6], &100020u32.to_le_bytes());
+        assert_eq!(quest_list(&[]), quest_list_empty());
+        assert_eq!(quest_accept_res(100020, true).len(), 18);
+        let r = QuestReward { exp: 604, zenny: 11, bp: 0, ether: 0, items: vec![(510042701, 1)] };
+        let c = quest_episode_complete_res(100050, &r);
+        assert_eq!(c.len(), 54 + 7);
+        assert_eq!(c[28], 1, "item count after the 7 u32");
+        assert_eq!(quest_episode_complete_res(1, &QuestReward::default()).len(), 54);
+        assert_eq!(quest_update(&[(1, 2), (3, 4)]).len(), 12);
+        assert_eq!(quest_helper_res(true, 7), [1, 7, 0, 0, 0]);
+        assert_eq!(maze_clear_info(&[], 9, true).len(), 6);
+        assert_eq!(maze_clear_info(&[(31, vec![21111, 21112])], 9, false).len(), 1 + 6 + 8 + 5);
+        let ev = QuestEventReq::parse(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(ev, QuestEventReq { episode: 1, condition: 2, param: 3 });
+        assert_eq!(QuestEventReq::parse(&[1, 0, 0, 0, 2, 0, 0, 0]).unwrap().param, 0);
+        assert_eq!(parse_quest_helper(&[1, 5, 0, 0, 0]), Some((true, 5)));
+        assert!(matches!(parse_gm_line("/questcomplete 100020"), GmCommand::QuestComplete(100020)));
+    }
+
+    #[test]
     fn complete_bits_match_client_layout() {
         let done = quest_complete_bits([0, 19, 43, 2047]);
         assert_eq!(done[0], 1);
@@ -1378,9 +1621,7 @@ mod quest_bit_tests {
         assert_eq!(done[255], 0x80);
         assert_eq!(done.iter().map(|b| b.count_ones()).sum::<u32>(), 4);
         // Trisha's episode 100185 (bit 43) is among the unlocked ones.
-        let d = default_completed_episodes();
-        assert!(gamedata::NPC_UNLOCK_EPISODES.iter().any(|e| e.0 == 100185));
-        assert_eq!(d[43 / 8] & (1 << (43 % 8)), 1 << 3);
+        assert!(gamedata::NPC_UNLOCK_EPISODES.iter().any(|e| e.0 == 100185 && e.1 == 43));
     }
 }
 
@@ -1756,6 +1997,91 @@ pub struct Monster {
     pub cooldowns: [u64; 10],
     /// Body radius (tb_Monster Monster_CollisionRadius, world units).
     pub radius: f32,
+    /// Monster_Defence_Type (0 = flinches on every hit).
+    pub defence: u8,
+    /// Hit reaction (damage motion) playing until this time: the AI keeps
+    /// still so its move / attack packets do not cut the flinch short.
+    pub stun_until: u64,
+}
+
+/// tb_Monster Monster_Defence_Type of a spawned monster (0 if unlisted).
+pub fn monster_defence(id: u32) -> u8 {
+    gamedata::MONSTER_DEFENCE.binary_search_by_key(&id, |m| m.0).map_or(0, |i| gamedata::MONSTER_DEFENCE[i].1)
+}
+
+/// A player attack event's hit area (gamedata::SKILL_AREAS): (back, start,
+/// radius, angle, deals damage).
+pub fn skill_area(skill: u32, trigger: u16) -> Option<(f32, f32, f32, f32, bool)> {
+    let i = gamedata::SKILL_AREAS.binary_search_by_key(&skill, |s| s.0).ok()?;
+    let e = gamedata::SKILL_AREAS[i].1.iter().find(|e| e.0 == trigger)?;
+    Some((f32::from(e.1), f32::from(e.2), f32::from(e.3), f32::from(e.4), e.5))
+}
+
+/// CMover::IsAttackDecision sector test for one attack event: apex
+/// `back` cm behind the attacker along its facing (client rot, math yaw =
+/// rot - 90), ring start..radius from the apex, within +-angle/2 of the
+/// facing; angle 0 = box / 360 = all around. `body` widens it by the
+/// target's radius (the client tests against the body, not the centre).
+pub fn in_attack_area(pos: [f32; 3], rot: f32, area: (f32, f32, f32, f32), target: [f32; 3], body: f32) -> bool {
+    let (back, start, radius, angle) = area;
+    let yaw = (rot - 90.0).to_radians();
+    let (fx, fy) = (yaw.cos(), yaw.sin());
+    let apex = [pos[0] - fx * back, pos[1] - fy * back];
+    let (dx, dy) = (target[0] - apex[0], target[1] - apex[1]);
+    let d = (dx * dx + dy * dy).sqrt();
+    if d > radius + body || d + body < start {
+        return false;
+    }
+    if angle <= 0.0 || angle >= 359.0 {
+        return true;
+    }
+    let off = (dy.atan2(dx) - yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    let half = (angle / 2.0).to_radians();
+    if off.abs() <= half {
+        return true;
+    }
+    // Body overlapping the sector's edge.
+    let edge = off.abs() - half;
+    edge < std::f32::consts::FRAC_PI_2 && d * edge.sin() <= body
+}
+
+/// A player skill's hit sector (radius cm, angle deg; gamedata::SKILL_CONE).
+pub fn skill_cone(skill: u32) -> Option<(f32, f32)> {
+    gamedata::SKILL_CONE
+        .binary_search_by_key(&skill, |s| s.0)
+        .ok()
+        .map(|i| (f32::from(gamedata::SKILL_CONE[i].1), f32::from(gamedata::SKILL_CONE[i].2)))
+}
+
+/// Is `target` (body radius `body`) inside a player's skill area: a sector of
+/// `radius` / `angle` deg from `pos` along the client facing `rot` (client
+/// degrees, math yaw = rot - 90)? Narrow beams take a target whose body
+/// touches the beam; 360 / 0 (box) are all around.
+pub fn in_skill_cone(pos: [f32; 3], rot: f32, radius: f32, angle: f32, target: [f32; 3], body: f32) -> bool {
+    let (dx, dy) = (target[0] - pos[0], target[1] - pos[1]);
+    let d = (dx * dx + dy * dy).sqrt();
+    if d > radius + body + 50.0 {
+        return false;
+    }
+    if angle >= 359.0 || angle <= 0.0 || d < body + 80.0 {
+        return true;
+    }
+    let yaw = (rot - 90.0).to_radians();
+    let half = (angle / 2.0 + 10.0).to_radians();
+    let off = (dy.atan2(dx) - yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    if off.abs() <= half {
+        return true;
+    }
+    // Beam edge: the body overlaps the sector's side.
+    let along = dx * yaw.cos() + dy * yaw.sin();
+    let side = (dx * yaw.sin() - dy * yaw.cos()).abs();
+    angle < 180.0 && along > 0.0 && side <= along * half.tan() + body
+}
+
+/// How far a skill's attack events reach from the attacker (cm), from the
+/// ActionData tagATTACK_RANGE (gamedata::SKILL_REACH).
+pub fn skill_reach(skill: u32) -> Option<f32> {
+    gamedata::SKILL_REACH.binary_search_by_key(&skill, |s| s.0).ok().map(|i| f32::from(gamedata::SKILL_REACH[i].1))
 }
 
 /// AI script and skill slots of a monster (tb_Monster Monster_AI_ID,
@@ -1925,6 +2251,21 @@ pub fn monsters_for_boxes(key: u16, boxes: &[u32], next: &mut u32) -> Vec<Monste
         let patk = if patk > 0 { i64::from(patk) } else { derived_patk(level) };
         let range = skill_row(skill).map_or(250.0, |s| f32::from(s.3.max(150)));
         *next += 1;
+        // Random-position boxes (m_eCreationPositionType Random) drop the
+        // monster anywhere inside the box, not on its centre.
+        let mut pos = pos;
+        if let Some(a) = gamedata::MAZE_SPAWN_AREAS.iter().find(|a| a.0 == key && a.1 == bid) {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos())
+                ^ bid.wrapping_mul(2654435761)
+                ^ next.wrapping_mul(40503);
+            let r1 = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            let r2 = r1.wrapping_mul(1103515245).wrapping_add(12345);
+            let unit = |r: u32| f32::from((r >> 16) as u16) / 32767.5 - 1.0;
+            pos[0] += unit(r1) * a.2;
+            pos[1] += unit(r2) * a.3;
+        }
         out.push(Monster {
             actor: ACTOR_MONSTER | *next,
             id,
@@ -1941,7 +2282,13 @@ pub fn monsters_for_boxes(key: u16, boxes: &[u32], next: &mut u32) -> Vec<Monste
             skill,
             range: range.min(600.0),
             speed: if speed > 0 { f32::from(speed) } else { 300.0 },
-            sight: if sight > 0 { (sight as f32).min(1500.0) } else { 1000.0 },
+            sight: match (sight, rank) {
+                (0, _) => 1000.0,
+                // 10000 is the bosses' whole-room value; GB-only trash rows
+                // carry it too and pulled entire rooms at once.
+                (s, r) if s >= 10_000 && r < 3 => 1000.0,
+                (s, _) => (s as f32).min(1500.0),
+            },
             counts,
             home: pos,
             aggro: false,
@@ -1954,6 +2301,8 @@ pub fn monsters_for_boxes(key: u16, boxes: &[u32], next: &mut u32) -> Vec<Monste
             attacked: false,
             cooldowns: [0; 10],
             radius: monster_radius(id),
+            defence: monster_defence(id),
+            stun_until: 0,
         });
     }
     out
@@ -1962,6 +2311,12 @@ pub fn monsters_for_boxes(key: u16, boxes: &[u32], next: &mut u32) -> Vec<Monste
 /// tb_Skill combat row: (skill, damage ratio %, basic damage, range, cooldown ms).
 pub fn skill_row(skill: u32) -> Option<&'static (u32, u16, u32, u16, u32, u8, u16)> {
     gamedata::SKILLS.binary_search_by_key(&skill, |s| s.0).ok().map(|i| &gamedata::SKILLS[i])
+}
+
+/// Attack frames of a skill: (trigger id, ms after the start), from the
+/// client ActionData (gamedata::SKILL_FRAMES). Empty = unknown skill.
+pub fn skill_frames(skill: u32) -> &'static [(u16, u16)] {
+    gamedata::SKILL_FRAMES.binary_search_by_key(&skill, |s| s.0).map_or(&[], |i| gamedata::SKILL_FRAMES[i].1)
 }
 
 /// Sectors of a maze map in order: (sector id, boss sector, exit portal).
@@ -2075,11 +2430,23 @@ pub fn skill_damage(skill: u32, level: u8, target_level: u8, roll: u32) -> i64 {
     (raw - raw * def / (def + 50 * i64::from(target_level.max(1)))).max(1)
 }
 
-/// A monster's hit on the player (same defence curve with the player's level).
-pub fn monster_damage(m: &Monster, player_level: u8, roll: u32) -> i64 {
+/// Player physical defence (SP_GET_FINAL_PDEF without gear:
+/// (STR x 0.5 + VIT) x Con_PDEF, STR/VIT = first + per-level x (level - 1)).
+/// Classes the 2020 tables lack (9, 10) use class 1's row.
+pub fn player_pdef(class: u8, level: u8) -> i64 {
+    let stats = gamedata::CLASS_STATS.iter().find(|c| c.0 == class).or_else(|| gamedata::CLASS_STATS.first());
+    let con = gamedata::CLASS_STATUS.iter().find(|c| c.0 == class).or_else(|| gamedata::CLASS_STATUS.first()).map_or(2.5, |c| c.4);
+    let Some(&(_, str0, str_up, vit0, vit_up)) = stats else { return 5 * i64::from(level.max(1)) };
+    let l = f32::from(level.max(1)) - 1.0;
+    ((((str0 + str_up * l) * 0.5) + (vit0 + vit_up * l)) * con) as i64
+}
+
+/// A monster's hit on the player: CMoverEx::GetDamageCalc,
+/// dmg x (1 - pdef / (pdef + 50 x target level)), at least 1.
+pub fn monster_damage(m: &Monster, player_class: u8, player_level: u8, roll: u32) -> i64 {
     let ratio = skill_row(m.skill).map_or(100, |s| i64::from(s.1.max(30)));
     let raw = m.patk * ratio / 100 * (90 + i64::from(roll % 21)) / 100;
-    let def = 5 * i64::from(player_level.max(1));
+    let def = player_pdef(player_class, player_level).max(1);
     (raw - raw * def / (def + 50 * i64::from(player_level.max(1)))).max(1)
 }
 
@@ -2217,7 +2584,10 @@ pub fn monster_skill_bt(actor: u32, skill: u32, pos: [f32; 3], rot: f32) -> Vec<
 /// ACTION_SKILL_BT 6/0x13 for a monster hitting the player.
 pub fn monster_hit_bt(actor: u32, skill: u32, pos: [f32; 3], rot: f32, target: u32, dmg: i64, hp_left: i64) -> Vec<u8> {
     let req = ActiveSkillReq { skill, pos, rot };
-    action_skill_bt(actor, &req, &[Hit { actor: target, damage: dmg, hp: hp_left }], 0)
+    // The monster's first attack frame of this skill (ActionData), so the
+    // client finds the attack event it applies the hit with.
+    let trigger = skill_frames(skill).first().map_or(0, |f| f.0);
+    action_skill_bt(actor, &req, &[Hit { actor: target, damage: dmg, hp: hp_left }], 0, trigger)
 }
 
 /// CHARACTER_UPDATE_STAT_LIST 3/0x34 — handler FUN_180dd9890, reader
@@ -2422,23 +2792,32 @@ pub struct Hit {
 /// 34 B: u32 attacker, f32 x/y/z/rot, i16 motion, u8, u8, u32 skill, i16
 /// trigger, u16 continuous hit, u8 counter, u8 penetrate). Order of fields
 /// from the reference server CMover::send_eSUB_CMD_ACTION_SKILL.
+/// Client names (handler FUN_180dd0770 globals): +4 g_bAttackTargetReactionType,
+/// +5 DamageFlag, +30 g_vAttackTargetExtraMove, +42 FlySpeed, +46
+/// g_byDefenceType, +47 g_dCurSuperArmorGage (f64), +55
+/// g_byAttackTargetHitPart (0 = body; was 4), +56 g_iReactMotion.
+/// `trigger` must be an attack event id of the skill's animation (ActionData
+/// AttackJudgmentTrigger): CPlayer::ActionSkill (FUN_1803fad80) looks it up
+/// with GetAttackEvent and drops the whole hit when it is missing ("Apply
+/// SkillDamageFrame>> ActionEvent not found"): no damage number, reaction or
+/// target HP bar. Trigger 0 made every player hit invisible.
 /// Hit result flags (SoulMeter SWPACKETDAMAGE_DAMAGETYPE): bit 0 MISS, bit 2
 /// CRIT, high nibble soul stone type. 1 made every hit a miss: no flinch,
 /// no damage number (the "monsters do not take hits" report).
 pub const HIT_NORMAL: u8 = 0;
 
-pub fn action_skill_bt(attacker: u32, req: &ActiveSkillReq, hits: &[Hit], combo: u16) -> Vec<u8> {
+pub fn action_skill_bt(attacker: u32, req: &ActiveSkillReq, hits: &[Hit], combo: u16, trigger: u16) -> Vec<u8> {
     let mut w = Writer::new();
     w.u8(hits.len().min(100) as u8);
     for h in hits.iter().take(100) {
         w.u32(h.actor).u8(1).u8(HIT_NORMAL).u64(h.damage as u64).u64(0).u64(h.hp.max(0) as u64);
-        w.u32(0).u32(0).u32(0).u32(0).u8(0).u64(0).u8(4).u32(0);
+        w.u32(0).u32(0).u32(0).u32(0).u8(0).u64(0).u8(0).u32(0);
     }
     w.u32(attacker);
     for v in req.pos {
         w.u32(v.to_bits());
     }
-    w.u32(req.rot.to_bits()).u16(0).u8(0).u8(0).u32(req.skill).u16(0).u16(combo).u8(0).u8(0);
+    w.u32(req.rot.to_bits()).u16(0).u8(0).u8(0).u32(req.skill).u16(trigger).u16(combo).u8(0).u8(0);
     w.finish()
 }
 

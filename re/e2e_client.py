@@ -77,7 +77,7 @@ class ClientConn:
             return True
 
 
-SIDE = {(0x11, 0x53), (0x11, 0x54), (0x11, 0x68), (0x11, 0x70), (0x17, 0x12), (8, 0x31), (8, 0x32), (5, 0x02), (5, 0x04), (6, 0x10), (0x17, 0x22), (3, 0x34), (3, 0x41), (0x11, 0x52), (0x11, 0x55), (0x11, 0x75)}
+SIDE = {(0x15, 0x07), (0x11, 0x64), (0x11, 0x53), (0x11, 0x54), (0x11, 0x68), (0x11, 0x70), (0x17, 0x12), (8, 0x31), (8, 0x32), (5, 0x02), (5, 0x04), (6, 0x10), (0x17, 0x22), (3, 0x34), (3, 0x41), (0x11, 0x52), (0x11, 0x55), (0x11, 0x75)}
 
 
 def is_side(m, s, p):
@@ -324,11 +324,13 @@ def main():
     open(os.path.join(os.environ.get("TEMP", "."), "swemu_charinfo.hex"), "w").write(p.hex())
     m, sub, p = w3.recv()
     assert (m, sub) == (0x15, 0x01) and len(p) == 256, (m, sub, len(p))
-    on = [i * 8 + j for i in range(256) for j in range(8) if p[i] >> j & 1]
-    assert on == [19, 29, 43], on  # NPC-unlocking story episodes (Janice, Eo, Trisha)
+    on = quest_bits(p)
+    # NPC-unlocking story episodes (Janice, Eo, Trisha) + the 9 tutorial
+    # episodes (bits 1..9); the starter episode 100020 (bit 10) is active.
+    assert {19, 29, 43} <= set(on) and len(on) == 12 and 10 not in on, on
     m, sub, p = w3.recv()
-    assert (m, sub) == (0x15, 0x02) and p == bytes(4), (m, sub, p)
-    print("[ok] QUEST_COMPLETE_LIST 21/0x01 + QUEST_LIST 21/0x02 (they let the client spawn NPCs)")
+    assert (m, sub) == (0x15, 0x02) and quest_eps(p) == [100020], (m, sub, p[:8])
+    print("[ok] QUEST_COMPLETE_LIST 21/0x01 (tutorial done) + QUEST_LIST 21/0x02 (starter episode 100020)")
     m, sub, p = w3.recv()
     assert (m, sub) == (6, 0x70) and struct.unpack_from("<I", p, 0)[0] == cid2, (m, sub, p[:4])
     print("[ok] SKILL_LOAD_INFO 6/0x70 follows (this is what switches the client to LoadingScene)")
@@ -345,6 +347,10 @@ def main():
     print(f"[ok] UPDATE_ORIGIN_STAT 3/0x51 on map load: {p[4]} stats (stamina + speed)")
     shop_items, last_cash = recv_cash_shop(w3)
     print(f"[ok] cash shop pushed on map load: {shop_items} products (9/0x20 pages) + 9/0x28 + cash balance 8/0x33")
+    m, sub, p = w3.recv(raw=True)
+    assert (m, sub, p) == (0x11, 0x64, b"\x00" + struct.pack("<IB", cid2, 1)), (m, sub, p)
+    print("[ok] MAZE_CLEAR_INFO 17/0x64 on map load: no story maze cleared yet")
+    quest_flow(w3)
     gesture = bytes.fromhex("E803000007C5244672752046 92E2B442 8766BE42 380A2FC1 00000000".replace(" ", ""))
     w3.send(0x23, 0x01, gesture)
     m, sub, p = w3.recv()
@@ -549,6 +555,7 @@ def main():
     m, sub, p = w3.recv()
     assert (m, sub) == (4, 0x02) and select_result(p[:-2])[3] == 0xD6E4, (m, sub, p[:8])
     print("[ok] WORLD_ENTER 4/0x01 -> 4/0x02: level 1 refused for Control Zone 43 (Lv.2, UI 0xD6E4)")
+    quest_complete_flow(w3)
     if gm_expected:
         lv = "/level 10".encode("utf-16-le")
         w3.send(7, 0x0A, struct.pack("<H", len(lv)) + lv)
@@ -831,12 +838,14 @@ def maze_play_checks(w4, cid, load_mons):
     gm_cmd(w4, "/killall", {(7, 0x01)})
     got = pump(w4, 2)
     step2 = sum(struct.unpack_from("<H", p, 0)[0] for p in got.get((4, 0x23), []))
-    assert step2 >= 2, f"step-2 monsters did not spawn: {step2}"
+    # Normal CZ43 has one spawn step: its step-2 Howler / Dredd boxes are on
+    # the Expert / VeryHard layers, which no maze turns on.
+    assert step2 == 0, f"Expert/VeryHard-layer monsters spawned: {step2}"
     gm_cmd(w4, "/killall", {(7, 0x01)})
     got2 = pump(w4, 2)
     for k, v in got2.items():
         got.setdefault(k, []).extend(v)
-    print(f"[ok] spawn steps: step 1 killed -> {step2} step-2 monsters spawn (4/0x23), then cleared")
+    print(f"[ok] spawn layers: CZ43 Normal has no Very Hard wave ({step2} step-2 monsters), sector cleared")
     side = {}
     for m, s, p in w4.side:
         side.setdefault((m, s), []).append(p)
@@ -883,6 +892,94 @@ def maze_play_checks(w4, cid, load_mons):
     assert exp > 0 and money > 0, (exp, money)
     print(f"[ok] boss sector 10003 cleared -> MAZE_REWARD_INFO 17/0x75 (rank {reward[0][0]}, EXP {exp}, Zenny {money})")
     gm_cmd(w4, "/god", {(7, 0x01)})
+    every = w4.replies + w4.side
+    steps = {struct.unpack_from("<IB", p, 2 + 5 * i) for m, s, p in every if (m, s) == (0x15, 0x07)
+             for i in range(struct.unpack_from("<H", p, 0)[0])}
+    assert {(1000351, 1), (1000401, 1)} <= steps, steps
+    print("[ok] QUEST_UPDATE 21/0x07 from the server: sector 10002 clear (episode 100035) and boss 30102003 kill (100040)")
+    clear = [p for m, s, p in every if (m, s) == (0x11, 0x64)]
+    assert clear and clear[-1] == struct.pack("<BIHI", 1, 32, 1, 21211) + struct.pack("<IB", cid, 0), clear
+    print("[ok] MAZE_CLEAR_INFO 17/0x64 after the clear: group 32 = [21211]")
+    # 100035 and 100040 have no finish NPC (tb_Quest_Episode Finish_Type 1):
+    # the server completes them itself; 100045 starts after 100040 (Auto_Start).
+    completed = [struct.unpack_from("<I", p, 0)[0] for m, s, p in every if (m, s) == (0x15, 0x05)]
+    assert {100035, 100040} <= set(completed), completed
+    lists = [p for m, s, p in every if (m, s) == (0x15, 0x02)]
+    assert lists and 100045 in quest_eps(lists[-1]) and not {100035, 100040} & set(quest_eps(lists[-1])), quest_eps(lists[-1])
+    print("[ok] auto-finish: 100035 / 100040 completed by the server (21/0x05), 100045 auto-started")
+    # A client complete for an already completed episode only resends the state.
+    w4.send(0x15, 0x05, struct.pack("<II", 100035, 0))
+    got = recv_until(w4, (0x15, 0x02))
+    assert (0x15, 0x05) not in got, got.keys()
+    print("[ok] QUEST_EPISODE_COMPLETE for an auto-finished episode: no second reward")
+
+
+def quest_bits(p):
+    return [i * 8 + j for i in range(256) for j in range(8) if p[i] >> j & 1]
+
+
+def quest_eps(p):
+    """QUEST_LIST 21/0x02 -> episode ids (entries of 58 bytes after the i16 count)."""
+    n = struct.unpack_from("<H", p, 0)[0]
+    assert len(p) == 2 + 58 * n + 2, (n, len(p))
+    return [struct.unpack_from("<I", p, 2 + 58 * i)[0] for i in range(n)]
+
+
+def recv_until(conn, last):
+    got = {}
+    while True:
+        m, sub, p = conn.recv()
+        got.setdefault((m, sub), []).append(p)
+        if (m, sub) == last:
+            return got
+
+
+def quest_flow(w3):
+    """Quest requests 21/0x02,03,06,08,09,11 on a fresh character."""
+    w3.send(0x15, 0x02, b"")
+    got = recv_until(w3, (0x15, 0x02))
+    assert quest_eps(got[(0x15, 0x02)][0]) == [100020] and (0x15, 0x01) in got, got.keys()
+    for ep in (100035, 100040, 100025):
+        w3.send(0x15, 0x03, struct.pack("<I", ep))
+        m, sub, p = w3.recv()
+        assert (m, sub) == (0x15, 0x03) and p == struct.pack("<IB", ep, 1) + bytes(13), (m, sub, p)
+        got = recv_until(w3, (0x15, 0x02))
+    assert quest_eps(got[(0x15, 0x02)][0]) == [100020, 100035, 100040, 100025]
+    w3.send(0x15, 0x03, struct.pack("<I", 4242))  # unknown episode: no answer
+    print("[ok] QUEST_ACCEPT 21/0x03 x3 -> 21/0x03 + refreshed 21/0x01 / 21/0x02 (4 active)")
+    w3.send(0x15, 0x08, struct.pack("<IIq", 100020, 1000201, 0))
+    m, sub, p = w3.recv()
+    assert (m, sub, p) == (0x15, 0x08, b""), (m, sub, p)
+    assert w3.take_side(0x15, 0x07) == [struct.pack("<HIB", 1, 1000201, 1)]
+    print("[ok] QUEST_EVENT_UPDATE 21/0x08 -> QUEST_UPDATE 21/0x07 (condition 1000201 step 1) + empty 21/0x08")
+    w3.send(0x15, 0x09, struct.pack("<BI", 1, 100025))
+    m, sub, p = w3.recv()
+    assert (m, sub, p) == (0x15, 0x09, struct.pack("<BI", 1, 100025)), (m, sub, p)
+    w3.send(0x15, 0x11, struct.pack("<I", 100025))
+    m, sub, p = w3.recv()
+    assert (m, sub, p) == (0x15, 0x11, struct.pack("<I", 100025)), (m, sub, p)
+    w3.send(0x15, 0x06, struct.pack("<I", 100025))
+    m, sub, p = w3.recv()
+    assert (m, sub, p) == (0x15, 0x06, struct.pack("<I", 100025)), (m, sub, p)
+    got = recv_until(w3, (0x15, 0x02))
+    assert quest_eps(got[(0x15, 0x02)][0]) == [100020, 100035, 100040]
+    print("[ok] QUEST_HELPER 21/0x09, QUEST_FAIL 21/0x11, QUEST_GIVE_UP 21/0x06 echoed; 100025 removed")
+
+
+def quest_complete_flow(w3):
+    """QUEST_EPISODE_COMPLETE 21/0x05: rewards once, then a no-op."""
+    w3.send(0x15, 0x05, struct.pack("<II", 100020, 0))
+    got = recv_until(w3, (0x15, 0x02))
+    res = got[(0x15, 0x05)][0]
+    ep, exp, zenny = struct.unpack_from("<III", res, 0)
+    assert (ep, zenny, len(res)) == (100020, 11, 54) and exp >= 604, (ep, exp, zenny, len(res))
+    assert (3, 0x37) in got and (8, 0x20) in got and 10 in quest_bits(got[(0x15, 0x01)][0]), got.keys()
+    assert quest_eps(got[(0x15, 0x02)][0]) == [100035, 100040]
+    w3.send(0x15, 0x05, struct.pack("<II", 100020, 0))
+    got = recv_until(w3, (0x15, 0x02))
+    assert set(got) == {(0x15, 0x01), (0x15, 0x02)}, got.keys()
+    print(f"[ok] QUEST_EPISODE_COMPLETE 21/0x05 100020: EXP {exp}, Zenny 11 (3/0x37, 8/0x20, bit 10 set); "
+          "a second completion pays nothing")
 
 
 def recv_cash_shop(conn):

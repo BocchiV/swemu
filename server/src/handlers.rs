@@ -146,6 +146,10 @@ pub fn dispatch(s: &mut Session, f: &Packet) -> Result<()> {
             info!(conn = s.id, "exit maze request");
             exit_maze(s);
         }
+        // Quest requests (OpenWorker Quest*Request; CQuestProcess::ReqQuest*).
+        (Role::Game, MAIN_QUEST, sub @ (0x02 | 0x03 | 0x05 | 0x06 | 0x08 | 0x09 | 0x11)) => {
+            crate::quest::request(s, sub, &f.payload);
+        }
         (Role::Game, MAIN_MAZE, 0x7E) => {
             let id = f.payload.get(0..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
             if s.character_id.is_some() {
@@ -234,13 +238,19 @@ pub fn dispatch(s: &mut Session, f: &Packet) -> Result<()> {
             let req = proto::ActiveSkillReq::parse(&f.payload)?;
             s.send(MAIN_SKILL, 0x09, proto::active_skill_res());
             crate::maze::spend_skill_cost(s, req.skill);
-            skill_hit(s, req);
+            start_skill(s, req);
         }
         // PASSIVE_SKILL_REQ 6/0x06 (u32 skill first): the dash / emergency
         // evade (e.g. 12040011, tb_Skill cost 20 stamina) arrives here.
         (Role::Game, MAIN_SKILL, 0x06) => {
             if let Some(b) = f.payload.get(0..4) {
-                crate::maze::spend_skill_cost(s, u32::from_le_bytes(b.try_into().unwrap()));
+                let skill = u32::from_le_bytes(b.try_into().unwrap());
+                // Dash / emergency evade (stamina skills): invincible for the
+                // evade's 'Invincible' window (ActionData 0.5-0.7 s).
+                if proto::skill_cost(skill).is_some_and(|c| c.0 == proto::stat::ST_CUR && s.stamina >= c.1) {
+                    s.invuln_until = crate::maze::now(s) + 600;
+                }
+                crate::maze::spend_skill_cost(s, skill);
             }
         }
         // PASSIVE_SKILL_END 6/0x05 -> 6/0x07 error 0 (OpenWorker SkillService).
@@ -516,20 +526,24 @@ fn select_character(s: &mut Session, req: SelectCharacterReq) {
         return;
     }
     let owned = s.shared.db.lock().unwrap().characters(account);
-    let owned = match owned {
-        Ok(rows) => rows.iter().any(|c| c.id == req.id),
+    let class = match owned {
+        Ok(rows) => rows.iter().find(|c| c.id == req.id).map(|c| c.class),
         Err(e) => {
             warn!(conn = s.id, "db: {e:#}");
-            false
+            None
         }
     };
-    if !owned {
+    let Some(class) = class else {
         warn!(conn = s.id, account, id = req.id, "SELECT_CHARACTER_REQ for a character the account does not own");
         s.send(MAIN_CHARACTER, 0x14, proto::select_character_fail(proto::MSG_LOGIN_FAILED, &s.shared.cfg.public_ip.clone()));
         return;
-    }
+    };
     let cfg = s.shared.cfg.clone();
-    let spot = proto::start_spot();
+    // Always a town (the class's start town): entering a maze straight from
+    // SELECT_CHARACTER_RES leaves the client in an empty map (it loads it as
+    // a district). The tutorial maze follows via WORLD_ENTER_RES once the
+    // town has loaded.
+    let spot = crate::quest::start_town(class);
     let map_instance = s.shared.issue_world_ticket(account, req.id, s.peer.ip(), spot, cfg.server_id);
     info!(conn = s.id, account, id = req.id, district = spot.map, "character selected; sending world address");
     let target = world_target(req.id, account, &cfg, map_instance, &spot);
@@ -606,9 +620,12 @@ fn world_enter(s: &mut Session, req: proto::WorldEnterReq) {
             return;
         };
         if level < m.min_level {
-            warn!(conn = s.id, map = req.map, level, need = m.min_level, "world enter: level too low");
-            refuse_world_enter(s, proto::MSG_ENTER_LEVEL);
-            return;
+            if s.shared.cfg.maze_level_gate {
+                warn!(conn = s.id, map = req.map, level, need = m.min_level, "world enter: level too low");
+                refuse_world_enter(s, proto::MSG_ENTER_LEVEL);
+                return;
+            }
+            info!(conn = s.id, map = req.map, level, need = m.min_level, "world enter: below maze level (gate disabled)");
         }
         change_world(s, account, character, m.start);
     } else {
@@ -645,17 +662,88 @@ fn send_maze_state(s: &mut Session) {
 /// damage (6/0x13), kill monsters at 0 HP (0x17/0x11) and grant EXP / levels
 /// (3/0x37, 3/0x36). Combat formulas are placeholders until tb_Skill /
 /// tb_Status are ported from the GameServer.
-fn skill_hit(s: &mut Session, req: proto::ActiveSkillReq) {
-    const REACH: f32 = 450.0;
+/// A skill started (6/0x08): its attack frames (client ActionData) land at
+/// their times, one ACTION_SKILL_BT each with the frame's trigger id (
+/// CUser::ActionProcess). Skills without known frames hit once at once.
+fn start_skill(s: &mut Session, req: proto::ActiveSkillReq) {
+    let frames = proto::skill_frames(req.skill);
+    if frames.is_empty() {
+        skill_hit(s, req, 0, 1);
+        return;
+    }
+    // A new skill cancels the frames the previous one had left, except the
+    // ones about to land: combo steps start right after the last hit, and
+    // dropping that hit made combos feel like they hit late or not at all.
+    let t = crate::maze::now(s);
+    let soon: Vec<_> = s.pending_hits.iter().copied().filter(|h| h.0 <= t + COMBO_FLUSH_MS).collect();
+    s.pending_hits.clear();
+    for (_, prev, trigger, n) in soon {
+        skill_hit(s, prev, trigger, n);
+    }
+    let n = frames.len().min(255) as u8;
+    for &(trigger, ms) in frames {
+        s.pending_hits.push((t + u64::from(ms), req, trigger, n));
+    }
+    due_hits(s);
+}
+
+/// Attack frames whose time has come (called on every 50 ms tick).
+pub fn due_hits(s: &mut Session) {
+    if s.pending_hits.is_empty() {
+        return;
+    }
+    let t = crate::maze::now(s);
+    let due: Vec<_> = s.pending_hits.iter().copied().filter(|h| h.0 <= t).collect();
+    s.pending_hits.retain(|h| h.0 > t);
+    for (_, req, trigger, frames) in due {
+        skill_hit(s, req, trigger, frames);
+    }
+}
+
+/// Most monsters one attack frame reaches (closest first).
+const MAX_FRAME_TARGETS: usize = 20;
+
+/// Previous-skill frames due within this many ms still land when the next
+/// skill starts.
+const COMBO_FLUSH_MS: u64 = 150;
+
+fn skill_hit(s: &mut Session, req: proto::ActiveSkillReq, trigger: u16, frames: u8) {
     let Some(character) = s.character_id else { return };
     if s.monsters.is_empty() {
         return;
     }
-    let targets = std::mem::take(&mut s.pre_targets);
-    let near = |m: &proto::Monster| {
-        let (dx, dy) = (m.pos[0] - req.pos[0], m.pos[1] - req.pos[1]);
-        dx * dx + dy * dy <= REACH * REACH
+    // Reach: the skill's attack area (ActionData tagATTACK_RANGE) plus a body
+    // radius; else tb_Skill Skill_Range_Max, 450 if unknown.
+    let reach = proto::skill_reach(req.skill).map(|r| (r + 100.0).min(2500.0)).unwrap_or_else(|| {
+        proto::skill_row(req.skill).map_or(450.0, |r| (f32::from(r.3) * 1.2).clamp(250.0, 900.0))
+    });
+    let targets = s.pre_targets.clone();
+    // Hit area: this attack event's ActionData sector (IsAttackDecision);
+    // else the skill's widest sector; else a circle. Buff / Evol events of an
+    // attack deal no damage.
+    let area = proto::skill_area(req.skill, trigger);
+    if area.is_some_and(|a| !a.4) {
+        return;
+    }
+    let cone = proto::skill_cone(req.skill);
+    let near = |m: &proto::Monster| match (area, cone) {
+        (Some(a), _) => proto::in_attack_area(req.pos, req.rot, (a.0, a.1, a.2, a.3), m.pos, m.radius),
+        (None, Some((r, ang))) => proto::in_skill_cone(req.pos, req.rot, r, ang, m.pos, m.radius),
+        (None, None) => {
+            let (dx, dy) = (m.pos[0] - req.pos[0], m.pos[1] - req.pos[1]);
+            dx * dx + dy * dy <= reach * reach
+        }
     };
+    let dist2 = |m: &proto::Monster| (m.pos[0] - req.pos[0]).powi(2) + (m.pos[1] - req.pos[1]).powi(2);
+    let mut chosen_ids: Vec<(f32, u32)> = s
+        .monsters
+        .iter()
+        .filter(|m| m.hp > 0 && if targets.is_empty() { near(m) } else { targets.contains(&m.actor) })
+        .map(|m| (dist2(m), m.actor))
+        .collect();
+    chosen_ids.sort_by(|a, b| a.0.total_cmp(&b.0));
+    chosen_ids.truncate(MAX_FRAME_TARGETS);
+    let chosen_ids: Vec<u32> = chosen_ids.into_iter().map(|c| c.1).collect();
     if s.dead {
         return;
     }
@@ -665,12 +753,12 @@ fn skill_hit(s: &mut Session, req: proto::ActiveSkillReq) {
     let mut dead = Vec::new();
     let mut roll = req.skill ^ s.monster_seq.wrapping_mul(2654435761) ^ u32::from(s.combo);
     for m in s.monsters.iter_mut() {
-        let chosen = if targets.is_empty() { near(m) } else { targets.contains(&m.actor) };
-        if !chosen || m.hp <= 0 {
+        if !chosen_ids.contains(&m.actor) || m.hp <= 0 {
             continue;
         }
         roll = roll.wrapping_mul(1103515245).wrapping_add(12345);
-        let dmg = proto::skill_damage(req.skill, level, m.level, roll >> 8);
+        // The skill's damage is shared by its attack frames.
+        let dmg = (proto::skill_damage(req.skill, level, m.level, roll >> 8) / i64::from(frames.max(1))).max(1);
         m.hp = (m.hp - dmg).max(0);
         hits.push(proto::Hit { actor: m.actor, damage: dmg, hp: m.hp });
         if m.hp == 0 {
@@ -683,7 +771,7 @@ fn skill_hit(s: &mut Session, req: proto::ActiveSkillReq) {
     }
     s.combo = s.combo.saturating_add(1);
     s.max_combo = s.max_combo.max(u32::from(s.combo));
-    s.send(MAIN_SKILL, 0x13, proto::action_skill_bt(character, &req, &hits, s.combo));
+    s.send(MAIN_SKILL, 0x13, proto::action_skill_bt(character, &req, &hits, s.combo, trigger));
     for h in &hits {
         let max = s.monsters.iter().find(|m| m.actor == h.actor).map_or(h.hp.max(1), |m| m.max_hp);
         s.send(MAIN_MONSTER, 0x12, proto::monster_stat(h.actor, h.hp, max));
@@ -703,6 +791,9 @@ fn skill_hit(s: &mut Session, req: proto::ActiveSkillReq) {
         s.send(MAIN_MONSTER, 0x11, proto::monster_die(actor));
         gained += proto::kill_exp(lv, rank);
     }
+    let gained = s.shared.cfg.scale_exp(gained);
+    let killed: Vec<u32> = fallen.iter().map(|f| f.0).collect();
+    crate::quest::on_kills(s, &killed);
     for (monster, pos) in fallen {
         drop_loot(s, monster, pos);
     }
@@ -730,6 +821,9 @@ fn kill_all(s: &mut Session, character: u32) {
         s.send(MAIN_MONSTER, 0x11, proto::monster_die(actor));
         gained += proto::kill_exp(lv, rank);
     }
+    let gained = s.shared.cfg.scale_exp(gained);
+    let killed: Vec<u32> = fallen.iter().map(|f| f.3).collect();
+    crate::quest::on_kills(s, &killed);
     for &(_, _, _, id, pos) in &fallen {
         drop_loot(s, id, pos);
     }
@@ -854,7 +948,12 @@ fn go_back_lobby(s: &mut Session, req: proto::GoBackLobbyReq) {
 fn exit_maze(s: &mut Session) {
     let (Some(account), Some(character)) = (s.account_id, s.character_id) else { return };
     let here = s.spot.unwrap_or_else(proto::start_spot);
-    let back = proto::maze(here.map).and_then(|m| m.escape).unwrap_or_else(proto::start_spot);
+    // The first tutorial maze continues in the second one.
+    let back = crate::quest::tutorial_next_maze(here.map)
+        .and_then(proto::maze)
+        .map(|m| m.start)
+        .or_else(|| proto::maze(here.map).and_then(|m| m.escape))
+        .unwrap_or_else(proto::start_spot);
     change_world(s, account, character, back);
 }
 
@@ -914,8 +1013,8 @@ fn character_info(s: &mut Session, req: CharacterInfoReq) {
     s.send(MAIN_CHARACTER, 0x32, proto::character_info_res(&row, &spot, map_instance, zenny));
     // Quest state comes right after the character (OpenWorker PersonService);
     // the client spawns district NPCs only once these flags are set.
-    s.send(MAIN_QUEST, 0x01, proto::quest_complete_list(&proto::default_completed_episodes()));
-    s.send(MAIN_QUEST, 0x02, proto::quest_list_empty());
+    crate::quest::ensure_started(s, character);
+    crate::quest::send_state(s, character);
     // CHARACTER_INFO_RES only queues LoadingScene; 6/0x70 applies it.
     let st = skill_state(s, character, class);
     s.send(MAIN_SKILL, 0x70, proto::skill_load_full(character, &st));
@@ -1048,6 +1147,21 @@ fn world_loaded(s: &mut Session) {
     // reply to the click arrives too late and the client crashes (dump 16:00:47,
     // AV at 0x180753356). Sending it here sets the "loaded" flag (CashShop+0xf0).
     send_cash_shop(s);
+    // Cleared story mazes (17/0x64) for the maze list.
+    crate::quest::send_clear_info(s, character);
+    // Episodes that finished by themselves while offline: only now, with the
+    // map loaded (rewards level the player up; 3/0x36 during the loading
+    // scene crashed the client, dump 11-3 21-43-19).
+    crate::quest::finish_pending(s, character);
+    // New character / tutorial in progress: on to the tutorial maze, once
+    // per connection.
+    if !s.tutorial_sent && !s.spot.is_some_and(|p| proto::is_maze(p.map)) {
+        if let Some(spot) = crate::quest::login_spot(s, character, s.class) {
+            s.tutorial_sent = true;
+            info!(conn = s.id, character, maze = spot.map, "tutorial: sending the character to the tutorial maze");
+            change_world(s, account, character, spot);
+        }
+    }
 }
 
 /// Whole tb_CashShop catalogue (paged 9/0x20) + banners + the cash balance.
@@ -1408,9 +1522,18 @@ fn gm_command(s: &mut Session, character: u32, line: &str) {
             s.god = !s.god;
             gm_say(s, character, if s.god { "god mode on" } else { "god mode off" });
         }
-        proto::GmCommand::Help => {
-            gm_say(s, character, "/item <id> [count], /cash <n>, /movespeed <rate>, /level <n>, /killall, /die, /heal, /god")
+        proto::GmCommand::QuestComplete(ep) => {
+            if crate::quest::complete(s, character, ep, false) {
+                gm_say(s, character, &format!("episode {ep} completed"));
+            } else {
+                gm_say(s, character, &format!("episode {ep}: unknown or already completed"));
+            }
         }
+        proto::GmCommand::Help => gm_say(
+            s,
+            character,
+            "/item <id> [count], /cash <n>, /movespeed <rate>, /level <n>, /killall, /die, /heal, /god, /questcomplete <episode>",
+        ),
         proto::GmCommand::Unknown(l) => gm_say(s, character, &format!("unknown or not yet supported: {l}")),
     }
 }

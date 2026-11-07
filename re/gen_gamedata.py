@@ -16,6 +16,7 @@ Usage: python gen_gamedata.py [--check]   (--check: compare with the file on dis
 import os
 import contextlib
 import io
+import re
 import struct
 import sys
 import zipfile
@@ -76,9 +77,19 @@ def npc_show_quests(b, npc_id):
 
 
 VBATCH_ARCHIVE = os.path.join(os.environ.get("SW_CLIENT", "."), "datas", "data09.v")
-# district id -> World/Table/<name>.vbatch (data09.v). Only districts the
-# server can put players in are listed.
-DISTRICT_MAPS = {10003: "F031_ROCCOTOWN"}
+# district id -> World/Table/<name>.vbatch (data09.v). The district id is the
+# file's VStartEventBox m_ID / 100 (F021 Candus City starts at 1002101, ...).
+# F001_TESTFIELD and F101_ETHEDLREDA (shares Arcadia's start box) are left out.
+DISTRICT_MAPS = {
+    10021: "F021_CANDUSCITY",
+    10003: "F031_ROCCOTOWN",
+    10031: "F041_GRACECITY",
+    10041: "F051_RUINFORTRESS",
+    10051: "F061_GRASSCOVERCAMP",
+    10061: "F071_DIPLUCEHORIZON",
+    10071: "F081_TOWEROFLORD",
+    10081: "F091_ARCADIAREALM",
+}
 
 
 def load_vbatch(name):
@@ -291,6 +302,63 @@ def parse_class_starts(b, cloth_ids):
     return out
 
 
+def gb_monster_rows(b, valid_skill):
+    """GB client tb_Monster rows: id -> (model, AI script name, 10 skill
+    slots, collision radius). Row = u32 id, wstr model, 111 B, wstr AI, 95 B,
+    10 x u32 skills; u16 radius at AI end + 152. Checked against the table:
+    skills equal on 2217 of 2314 common rows, AI name on 2297, radius on
+    589/600 sampled. Rows whose slots are not real skill ids (bosses with an
+    extra field) get no skills (caller falls back)."""
+    out = {}
+    for mid, mdl in gb_monster_models(b).items():
+        p = b.find(mdl.encode("utf-16le"))
+        q = p - 6
+        while q >= 0 and struct.unpack_from("<I", b, q)[0] != mid:
+            p = b.find(mdl.encode("utf-16le"), p + 1)
+            if p < 0:
+                break
+            q = p - 6
+        if p < 0:
+            continue
+        a = p + 2 * len(mdl) + 111
+        an = struct.unpack_from("<H", b, a)[0]
+        if not 0 < an < 80 or a + 2 + 2 * an + 95 + 160 > len(b):
+            continue
+        ai = b[a + 2:a + 2 + 2 * an].decode("utf-16le", "replace")
+        e = a + 2 + 2 * an
+        sk = list(struct.unpack_from("<10I", b, e + 95))
+        if not all(x == 0 or valid_skill(x) for x in sk):
+            sk = None
+        rad = struct.unpack_from("<H", b, e + 152)[0]
+        out[mid] = (mdl, ai, sk, rad if rad < 2000 else 0)
+    return out
+
+
+def gb_monster_models(b, origins=None):
+    """GB client tb_Monster: monster id -> model name. Rows start u32 id,
+    wstr model ("MOB_..."), u32 origin: the row's own id, or (523 spawned
+    GB-only monsters) another monster's id whose data it is derived from.
+    `origins` (dict) receives id -> origin."""
+    out = {}
+    ai = "Ai_".encode("utf-16le")
+    for m in re.finditer(rb"M\x00O\x00B\x00_\x00", b):
+        p = m.start()
+        if p < 6 or b[p - 6:p] == ai:
+            continue
+        mid, n = struct.unpack_from("<IH", b, p - 6)
+        end = p + 2 * n
+        if not (0 < n < 100 and end + 4 <= len(b) and 1_000_000 <= mid < 1_000_000_000):
+            continue
+        org = struct.unpack_from("<I", b, end)[0]
+        if not 1_000_000 <= org < 1_000_000_000:
+            continue
+        out[mid] = b[p:end].decode("utf-16le", "replace")
+        if origins is not None:
+            origins[mid] = org
+    return out
+
+
+
 def skill_ids(b):
     """tb_Skill: every skill id (rows start u32 id, u16, u32 id again)."""
     ids = set()
@@ -321,6 +389,154 @@ def class_skills(info, starts, skills):
 
 def item_ids(b):
     return b  # membership checked by searching the packed u32
+
+
+def skill_frame_lines(sk, gb_models, mon_skills):
+    """SKILL_FRAMES: attack frames (trigger id, ms) per skill from the client
+    ActionData (action_data.py). Player skills use their class's PC_<letter>
+    .adf (tb_Skill row class byte at +16), monster skills the model's .adf."""
+    import action_data
+    import maze_data
+    pw = maze_data._pw()
+    groups = skill_ids(sk)
+    rows = {}
+    for o in range(4, len(sk) - 30):
+        sid, grp = struct.unpack_from("<I", sk, o)[0], struct.unpack_from("<I", sk, o + 6)[0]
+        if grp in groups and 0 <= sid - grp < 40 and sid not in rows:
+            rows[sid] = o
+    order = sorted(rows.values())
+    nxt = {order[i]: order[i + 1] for i in range(len(order) - 1)}
+    adf_cache = {}
+    reach_cache = {}
+    cone_cache = {}
+    region_cache = {}
+
+    def frames(adf_name):
+        if adf_name not in adf_cache:
+            try:
+                raw = maze_data.read("data04", f"Character/ActionData/{adf_name}.adf", pw)
+                adf_cache[adf_name] = action_data.attack_frames(raw)
+                reach_cache[adf_name] = action_data.attack_reach(raw)
+                cone_cache[adf_name] = action_data.attack_cone(raw)
+                region_cache[adf_name] = action_data.attack_regions(raw)
+            except Exception:
+                adf_cache[adf_name] = {}
+                reach_cache[adf_name] = {}
+                cone_cache[adf_name] = {}
+                region_cache[adf_name] = {}
+        return adf_cache[adf_name]
+
+    reach = {}
+    cone = {}
+    regions = {}
+
+    def action(sid):
+        o = rows.get(sid)
+        if o is not None:
+            return action_data.skill_action(sk, o, nxt.get(o, o + 800))
+        # Monster skill rows (u32 id, u16 1, group 0): the action name is the
+        # first string within the row head (+173 like player rows).
+        p = sk.find(struct.pack("<I", sid))
+        while p != -1:
+            act = action_data.skill_action(sk, p, p + 240)
+            if act:
+                return act
+            p = sk.find(struct.pack("<I", sid), p + 1)
+        return None
+
+    out = {}
+    no_action = no_anim = 0
+    for sid, o in rows.items():
+        cls = sk[o + 16]
+        if not 1 <= cls <= 10:
+            continue
+        act = action(sid)
+        if not act:
+            no_action += 1
+            continue
+        adf_name = f"PC_{chr(ord('A') + cls - 1)}"
+        fr = frames(adf_name).get(act)
+        if fr:
+            out[sid] = fr
+            if act in reach_cache[adf_name]:
+                reach[sid] = reach_cache[adf_name][act]
+            if act in cone_cache[adf_name]:
+                cone[sid] = cone_cache[adf_name][act]
+            if act in region_cache[adf_name]:
+                regions[sid] = region_cache[adf_name][act]
+        else:
+            no_anim += 1
+    players = len(out)
+    mon_hit = mon_miss = 0
+    for mid, sks in sorted(mon_skills.items()):
+        model = gb_models.get(mid)
+        if not model:
+            continue
+        for sid in sks:
+            if sid in out:
+                continue
+            act = action(sid)
+            fr = frames(model).get(act) if act else None
+            if fr:
+                out[sid] = fr
+                if act in reach_cache[model]:
+                    reach[sid] = reach_cache[model][act]
+                mon_hit += 1
+            else:
+                mon_miss += 1
+    print(f"skill frames: {players} player skills ({no_action} rows without an action, {no_anim} actions "
+          f"without attack events), {mon_hit} monster skills ({mon_miss} monster skill uses without frames)")
+    lines = [
+        "/// Attack frames per skill (client ActionData .adf AttackJudgmentTrigger):",
+        "/// (skill, [(trigger id, ms after the skill starts)]). The server sends one",
+        "/// ACTION_SKILL_BT per frame with that trigger id (CUser::ActionProcess).",
+        "/// Sorted by skill.",
+        "pub const SKILL_FRAMES: &[(u32, &[(u16, u16)])] = &[",
+    ]
+    for sid in sorted(out):
+        fr = out[sid][:16]
+        lines.append(f"    ({sid}, &[{', '.join(f'({t}, {min(ms, 65535)})' for t, ms in fr)}]),")
+    print(f"skill reach: {len(reach)} of {len(out)} skills with frames have an attack area "
+          f"({len(out) - len(reach)} without: no parseable tagATTACK_RANGE)")
+    lines += [
+        "];",
+        "",
+        "/// Hit reach per skill (cm from the attacker): farthest point of its attack",
+        "/// events' tagATTACK_RANGE (forward offset of vCenterPos + fRadius or box",
+        "/// size; CMySkillList::GetAttackArea / CheckSkillTarget). Sorted by skill.",
+        "pub const SKILL_REACH: &[(u32, u16)] = &[",
+    ]
+    for sid in sorted(reach):
+        lines.append(f"    ({sid}, {min(int(round(reach[sid])), 65535)}),")
+    lines += [
+        "];",
+        "",
+        "/// Player skill hit area: (skill, radius cm, angle deg) of the widest",
+        "/// damage event (ActionData tagATTACK_RANGE fRadius / fAngle): a sector",
+        "/// from the attacker along its facing; 360 = all around, 0 = box. Sorted.",
+        "pub const SKILL_CONE: &[(u32, u16, u16)] = &[",
+    ]
+    for sid in sorted(cone):
+        r, ang = cone[sid]
+        lines.append(f"    ({sid}, {min(int(round(r)), 65535)}, {min(int(round(ang)), 360)}),")
+    lines += [
+        "];",
+        "",
+        "/// Player hit area per attack event: (skill, [(client event key, back cm,",
+        "/// start cm, radius cm, angle deg, deals damage)]). IsAttackDecision:",
+        "/// a sector whose apex sits `back` cm behind the attacker (vCenterPos.y;",
+        "/// client local forward is -y), from start to radius along the facing,",
+        "/// within +-angle/2; angle 0 = box (radius = box size). Sorted by skill.",
+        "pub const SKILL_AREAS: &[(u32, &[(u16, i16, u16, u16, u16, bool)])] = &[",
+    ]
+    for sid in sorted(regions):
+        ev = sorted(regions[sid].items())
+        body = ", ".join(f"({k}, {max(-32768, min(32767, int(round(b))))}, {min(int(round(st)), 65535)}, "
+                         f"{min(int(round(r)), 65535)}, {min(int(round(a)), 360)}, {'true' if d else 'false'})"
+                         for k, (b, st, r, a, d) in ev if k < 65536)
+        lines.append(f"    ({sid}, &[{body}]),")
+    lines += ["];", ""]
+    return lines
 
 
 def main():
@@ -420,11 +636,15 @@ def main():
             lines.append(f"        ({nid}, [{x:.3f}, {y:.3f}, {z:.3f}], {rot:.3f}, {wp}, {sec}),")
         lines.append("    ]),")
     # Town NPCs hidden until a story episode is completed (tb_NPC visible = 0,
-    # episode with state 2 = "completed" only). Until quests are implemented
-    # the server reports these episodes as completed so the NPCs spawn.
+    # episode with state 2 = "completed" only). The server reports these
+    # episodes as completed so the NPCs spawn. Rocco Town only (Janice, Eo,
+    # Trisha): faking later story episodes for the other towns would make
+    # NPCs offer episodes out of story order.
     bits = quest_bits(episodes)
     unlock = {}
     for district, name in sorted(DISTRICT_MAPS.items()):
+        if district != 10003:
+            continue
         for nid, *_ in parse_vbatch_npcs(load_vbatch(name)):
             row = npc_show_quests(npc_tab, nid)
             if row and row[0] == 0:
@@ -479,6 +699,9 @@ def main():
     ]
     for district, bid, (x, y, z), rot in exits:
         lines.append(f"    ({district}, {bid}, [{x:.3f}, {y:.3f}, {z:.3f}], {rot:.3f}),")
+    import maze_spawn
+    print(f"spawn boxes: {len(spawn_rows)} kept, {maze_spawn.SKIPPED[0]} dropped "
+          f"(layer {'/'.join(sorted(maze_spawn.INACTIVE_LAYERS))}: no maze turns it on)")
     lines += [
         "];",
         "",
@@ -490,6 +713,16 @@ def main():
     for mid, bid, imm, mons, (x, y, z), rot, sector, wp, step in spawn_rows:
         ids = ", ".join(str(m) for m in mons)
         lines.append(f"    ({mid}, {bid}, {'true' if imm else 'false'}, &[{ids}], [{x:.1f}, {y:.1f}, {z:.1f}], {rot:.1f}, {sector}, {wp}, {step}),")
+    lines += [
+        "];",
+        "",
+        "/// Spawn boxes whose monster appears at a random point of the box",
+        "/// (m_eCreationPositionType Random): (maze, box id, half size x, half",
+        "/// size y). Sorted by maze, box.",
+        "pub const MAZE_SPAWN_AREAS: &[(u16, u32, f32, f32)] = &[",
+    ]
+    for mid, bid, hx, hy in sorted(set(maze_data.AREA_ROWS)):
+        lines.append(f"    ({mid}, {bid}, {hx:.1f}, {hy:.1f}),")
     lines += [
         "];",
         "",
@@ -537,6 +770,51 @@ def main():
     import server_tables
     jp_mons = {m["id"]: m for m in server_tables.table("tb_Monster.res", server_tables.monster)}
     used = sorted({m for r in spawn_rows for m in r[3]})
+    import tbgen
+    tbm = {r["ID"]: r for r in tbgen.load("TB_MONSTER", "tb_Monster.res")}
+    # Monsters added after the 2020 server (e.g. the Tower of Lord mazes
+    # 28xxx, 309011xx) have no row. They borrow AI, skills, speed and rank
+    # from a monster with the same model (GB client tb_Monster model name,
+    # "MOB_0282_WildStone" -> "MOB_0282_JH_WildStone"), and take the level
+    # of the maze they spawn in; HP and attack are derived from that level.
+    gb_mon_raw = maze_data.read("data11", "../bin/Table/tb_Monster.res", maze_data._pw())
+    gb_origin = {}
+    gb_models = gb_monster_models(gb_mon_raw, gb_origin)
+    gb_skill_raw = maze_data.read("data11", "../bin/Table/tb_Skill.res", maze_data._pw())
+    gb_rows = gb_monster_rows(gb_mon_raw, lambda x: 1_000_000_000 <= x < 2_000_000_000 and gb_skill_raw.find(struct.pack("<I", x)) >= 0)
+    have_jp = {m for m in jp_mons if m in tbm}
+    by_prefix = {}
+    for m in have_jp:
+        mdl = gb_models.get(m)
+        if mdl:
+            by_prefix.setdefault("_".join(mdl.split("_")[:2]), []).append(m)
+    maze_lv = {}
+    for mid_, lv, _fp, _j, _p, _r, _f, _b, key in mazes:
+        maze_lv[key] = min(maze_lv.get(key, 255), lv) if lv else maze_lv.get(key, 0)
+    gb_level = {}
+    for r in spawn_rows:
+        for m in r[3]:
+            if maze_lv.get(r[0]):
+                gb_level[m] = max(gb_level.get(m, 0), maze_lv[r[0]])
+    template = {}
+    for m in used:
+        if m in have_jp:
+            continue
+        org = gb_origin.get(m)
+        if org in have_jp and org != m:
+            # The GB row names the monster it is derived from.
+            template[m] = org
+            continue
+        mdl = gb_models.get(m, "")
+        cands = by_prefix.get("_".join(mdl.split("_")[:2]), []) if mdl.startswith("MOB_") else []
+        if cands:
+            gb_ai = (gb_rows.get(m) or (None, ""))[1].lower()
+            same_ai = [c for c in cands if (tbm[c]["Monster_AI_ID"] or "").lower() == gb_ai]
+            exact = [c for c in cands if gb_models.get(c, "").replace("_JH", "") == mdl]
+            template[m] = max(same_ai or exact or cands, key=lambda c: (jp_mons[c]["level"], -c))
+    src = lambda m: template.get(m, m)
+    print(f"monsters: {len(template)} GB-only spawned ids borrow a template by model, "
+          f"{sum(1 for m in used if m not in have_jp and m not in template)} have none")
     lines += [
         "];",
         "",
@@ -546,20 +824,45 @@ def main():
         "/// Monster_Type 0/3/11 and Monster_ClearCondition_Type != 1)). Sorted by id.",
         "pub const MONSTERS: &[(u32, u8, u8, u32, u32, u32, u16, u32, bool)] = &[",
     ]
-    import tbgen
-    tbm = {r["ID"]: r for r in tbgen.load("TB_MONSTER", "tb_Monster.res")}
     missing = 0
     for mid in used:
-        m = jp_mons.get(mid)
-        t = tbm.get(mid)
+        m = jp_mons.get(src(mid))
+        t = tbm.get(src(mid))
         if m and t:
             sk = m["skills"][0] if m["skills"] else 0
             counts = t["Monster_Type"] in (0, 3, 11) and t["Monster_ClearCondition_Type"] != 1
             speed = t["Monster_Run_Speed"] or t["Monster_Walk_Speed"]
-            lines.append(f"    ({mid}, {m['level']}, {m['rank']}, {max(m['hp'], 0)}, {max(m['patk'], 0)}, {sk}, {speed}, {t['Monster_Sight']}, {'true' if counts else 'false'}),")
+            if mid in template:
+                # Template stats at the maze's level: HP / attack 0 = derive.
+                # Attack skill: the monster's own first GB slot.
+                level, hp, patk = gb_level.get(mid) or m["level"], 0, 0
+                own = (gb_rows.get(mid) or (0, 0, None))[2]
+                sk = next((x for x in own or [] if x), sk)
+            else:
+                level, hp, patk = m["level"], max(m["hp"], 0), max(m["patk"], 0)
+            lines.append(f"    ({mid}, {level}, {m['rank']}, {hp}, {patk}, {sk}, {speed}, {t['Monster_Sight']}, {'true' if counts else 'false'}),")
         else:
             missing += 1
+            if gb_level.get(mid):
+                # No row and no template: the maze's level (the server's
+                # defaults were level 1, one-hit kills) and the GB row's skill.
+                own = (gb_rows.get(mid) or (0, 0, None))[2]
+                sk0 = next((x for x in own or [] if x), 0)
+                lines.append(f"    ({mid}, {gb_level[mid]}, 0, 0, 0, {sk0}, 0, 0, true),")
     print(f"monsters: {len(used) - missing} of {len(used)} spawned ids have stats, {missing} use derived stats (GB-only ids)")
+    defence = {mid: tbm[src(mid)]["Monster_Defence_Type"] for mid in used
+               if tbm.get(src(mid)) and tbm[src(mid)]["Monster_Defence_Type"]}
+    print(f"monster defence: {len(defence)} of {len(used)} spawned ids resist hit reactions (type 1/2/3/5)")
+    lines += [
+        "];",
+        "",
+        "/// Monster_Defence_Type (tb_Monster, GB-only ids via their template) for",
+        "/// monsters that do not flinch on every hit: 1/2 only on strong attacks,",
+        "/// 3/5 never (CMover::IsDamageMotionDisplay). Missing = 0. Sorted by id.",
+        "pub const MONSTER_DEFENCE: &[(u32, u8)] = &[",
+    ]
+    for mid in sorted(defence):
+        lines.append(f"    ({mid}, {defence[mid]}),")
     # Drops (tb_Drop / tb_Drop_Group, logic CDropProcess::MakeDropItems):
     # only items that exist in the GB client's tb_Item are kept.
     jp_drops = {r["id"]: r for r in server_tables.table("tb_Drop.res", server_tables.drop)}
@@ -625,7 +928,8 @@ def main():
     # spawned monster uses, and the class status rows (HP first + growth).
     import tbgen
     jp_skills = {r["Skill_Index"]: r for r in tbgen.load("TB_SKILL", "tb_Skill.res")}
-    want = set(skill_ids(skill_tab)) | {m["skills"][0] for mid in used if (m := jp_mons.get(mid)) and m["skills"]}
+    want = set(skill_ids(skill_tab)) | {m["skills"][0] for mid in used if (m := jp_mons.get(src(mid))) and m["skills"]}
+    want |= {x for mid in used if mid not in have_jp and (r := gb_rows.get(mid)) and r[2] for x in r[2] if x}
     sk_rows = sorted((i, jp_skills[i]) for i in want if i in jp_skills)
     print(f"skills: {len(sk_rows)} of {len(want)} class/monster skills found in tb_Skill (others use ratio 100, range 250)")
     lines += [
@@ -648,6 +952,15 @@ def main():
     ]
     for r in status:
         lines.append(f"    ({r['ID'] - 1000}, {int(r['Con_HP_First_Value'])}, {r['Con_HP_Grow']:.2f}, {r['Con_PATK_Max']:.3f}, {r['Con_PDEF']:.3f}),")
+    lines += [
+        "];",
+        "",
+        "/// Class base stats (tb_Status 1000 + class): (class, STR first, STR per",
+        "/// level, VIT first, VIT per level) for SP_GET_FINAL_PDEF.",
+        "pub const CLASS_STATS: &[(u8, f32, f32, f32, f32)] = &[",
+    ]
+    for r in status:
+        lines.append(f"    ({r['ID'] - 1000}, {r['STR_First_Value']:.3f}, {r['STR_UP_Value']:.3f}, {r['VIT_First_Value']:.3f}, {r['VIT_UP_Value']:.3f}),")
     lv = maze_data.read("data11", "../bin/Table/tb_Levelup_Point.res", maze_data._pw())
     n = struct.unpack_from("<I", lv, 0)[0]
     assert 0 <= len(lv) - 4 - n * 8 < 64, "tb_Levelup_Point layout drift"
@@ -697,11 +1010,106 @@ def main():
         lines.append(f"    ({r['Level']}, {r['Give_Skill_Point']}),")
     lines += ["];", ""]
     print(f"skill tree: {len(tree)} rows")
+    # Quests (GB tb_Quest_Episode / tb_Quest_Condition, layout in
+    # quest_data.py), the monster quest groups hunt conditions count (
+    # tb_Monster Quest_Group_1..5) and the story mazes MAZE_CLEAR_INFO
+    # 17/0x64 reports (GB tb_Maze_Info: u16 Maze_Group at +3, u8
+    # Maze_Episode_No at +37; CGocRecode::UpdateClearInfo keeps
+    # episodes 1..5 only).
+    import quest_data
+    import gb_maze
+    pw = maze_data._pw()
+    q_eps = quest_data.episodes(maze_data.read("data11", "../bin/Table/tb_Quest_Episode.res", pw))
+    q_conds = quest_data.conditions(maze_data.read("data11", "../bin/Table/tb_Quest_Condition.res", pw))
+    lines += [
+        "/// Quest episodes (GB tb_Quest_Episode): (episode, Complete_Bit, condition",
+        "/// ids in slot order, reward EXP, Zenny, ether, BP, reward items (item, count)).",
+        "/// Sorted by id.",
+        "pub const QUEST_EPISODES: &[(u32, u16, &[u32], u32, u32, u32, u32, &[(u32, u32)])] = &[",
+    ]
+    for eid, e in sorted(q_eps.items()):
+        conds = ", ".join(str(c) for c in e["conds"] if c in q_conds)
+        rewards = ", ".join(f"({i}, {n})" for i, n in e["items"])
+        lines.append(f"    ({eid}, {e['bit']}, &[{conds}], {e['exp']}, {e['zenny']}, {e['ether']}, {e['bp']}, &[{rewards}]),")
+    lines += [
+        "];",
+        "",
+        "/// Episodes that complete by themselves once every condition is done",
+        "/// (tb_Quest_Episode Finish_Type 1: no finish NPC, the client never sends",
+        "/// QUEST_EPISODE_COMPLETE). Sorted.",
+        "pub const QUEST_AUTO_FINISH: &[u32] = &[",
+    ]
+    auto_finish = sorted(e for e, d in q_eps.items() if d["auto_finish"])
+    lines += [f"    {e}," for e in auto_finish]
+    lines += [
+        "];",
+        "",
+        "/// Episodes accepted automatically when another one is completed",
+        "/// (tb_Quest_Episode Auto_Start, event 7): (completed episode, episode).",
+        "/// Sorted.",
+        "pub const QUEST_AUTO_START: &[(u32, u32)] = &[",
+    ]
+    auto_start = sorted((d["auto_after"], e) for e, d in q_eps.items() if d["auto_after"] in q_eps)
+    lines += [f"    ({p}, {e})," for p, e in auto_start]
+    print(f"quests: {len(auto_finish)} auto-finish episodes, {len(auto_start)} auto-start links")
+    lines += [
+        "];",
+        "",
+        "/// Quest conditions (GB tb_Quest_Condition): (condition, type, target type,",
+        "/// target id, count, mazes it counts in (empty = anywhere)). Types follow",
+        "/// OpenWorker QuestConditionType (3 hunt, 10 clear), targets",
+        "/// QuestConditionTarget (1 monster, 7 maze, 8 monster group, 9 sector). Sorted.",
+        "pub const QUEST_CONDITIONS: &[(u32, u8, u8, u32, u8, &[u16])] = &[",
+    ]
+    for cid, (ct, tt, target, count, mz) in sorted(q_conds.items()):
+        lines.append(f"    ({cid}, {ct}, {tt}, {target}, {count}, &[{', '.join(map(str, mz))}]),")
+    hunt_groups = {c[2] for c in q_conds.values() if c[0] == 3 and c[1] == 8}
+    mon_groups = {}
+    for r in tbgen.load("TB_MONSTER", "tb_Monster.res"):
+        gs = [r[f"Quest_Group_{i}"] for i in range(1, 6) if r[f"Quest_Group_{i}"] in hunt_groups]
+        if gs:
+            mon_groups[r["ID"]] = gs
+    lines += [
+        "];",
+        "",
+        "/// Monster -> quest groups a kill counts for (tb_Monster Quest_Group_1..5,",
+        "/// only groups GB hunt conditions target). Sorted by monster id.",
+        "pub const MONSTER_QUEST_GROUPS: &[(u32, &[u32])] = &[",
+    ]
+    for mid, gs in sorted(mon_groups.items()):
+        lines.append(f"    ({mid}, &[{', '.join(map(str, gs))}]),")
+    clear_rows = []
+    for mid, (_name, fixed) in sorted(gb_maze.gb_maze_maps().items()):
+        group, ep = struct.unpack_from("<H", fixed, 3)[0], fixed[37]
+        if 1 <= ep <= 5 and group:
+            clear_rows.append((mid, group, ep))
+    lines += [
+        "];",
+        "",
+        "/// Story mazes MAZE_CLEAR_INFO reports: (maze, Maze_Group, episode 1..5),",
+        "/// from GB tb_Maze_Info. Sorted by maze id.",
+        "pub const MAZE_CLEAR_GROUPS: &[(u16, u16, u8)] = &[",
+    ]
+    for mid, group, ep in clear_rows:
+        lines.append(f"    ({mid}, {group}, {ep}),")
+    lines += ["];", ""]
+    print(f"quests: {len(q_eps)} episodes, {len(q_conds)} conditions, {len(mon_groups)} monsters with quest groups, "
+          f"{len(clear_rows)} story mazes")
     # Monster AI (Scripts/AI/*.lua via ai_scripts.py, tb_Monster
     # Monster_AI_ID) and all 10 skill slots per monster.
     import ai_scripts
     ais = ai_scripts.load()
-    ai_names = sorted({(tbm[m]["Monster_AI_ID"] or "").lower() for m in used if m in tbm} & set(ais))
+    def ai_of(m):
+        # monsters: their script; GB-only: the GB row's own script name
+        # (Scripts/AI has many of them), else the template's.
+        if m in have_jp:
+            return (tbm[m]["Monster_AI_ID"] or "").lower()
+        own = (gb_rows.get(m) or (0, ""))[1].lower()
+        if own in ais or src(m) not in tbm:
+            return own
+        return (tbm[src(m)]["Monster_AI_ID"] or "").lower()
+
+    ai_names = sorted({ai_of(m) for m in used} & set(ais))
     ai_index = {n: i for i, n in enumerate(ai_names)}
     lines += [
         "/// Monster AI (Scripts/AI): (check ms, select ms lo/hi, attack ms",
@@ -732,17 +1140,31 @@ def main():
         "/// radius (tb_Monster Monster_CollisionRadius)).",
         "pub const MONSTER_AI: &[(u32, u16, [u32; 10], u16)] = &[",
     ]
-    with_ai = 0
+    with_ai = gb_own = 0
+    mon_skills = {}
     for mid in used:
-        t = tbm.get(mid)
-        if not t:
+        t = tbm.get(src(mid))
+        own = gb_rows.get(mid) if mid not in have_jp else None
+        if not t and not own:
             continue
-        idx = ai_index.get((t["Monster_AI_ID"] or "").lower(), 65535)
+        idx = ai_index.get(ai_of(mid), 65535)
         with_ai += idx != 65535
-        sk = [t[f"Monster_Skill{k}_ID"] for k in range(1, 11)]
-        rad = max(int(t["Monster_CollisionRadius"] or 0), 0)
+        if own and own[2]:
+            # GB-only monster: its own skill slots (slot order is what the AI
+            # script's skill groups index) and radius from the GB row.
+            sk, rad = own[2], own[3]
+            gb_own += 1
+        elif not t:
+            # GB row without readable skill slots and no template.
+            sk, rad = [0] * 10, own[3]
+        else:
+            sk = [t[f"Monster_Skill{k}_ID"] for k in range(1, 11)]
+            rad = max(int(t["Monster_CollisionRadius"] or 0), 0)
         lines.append(f"    ({mid}, {idx}, [{', '.join(map(str, sk))}], {rad}),")
+        mon_skills[mid] = [x for x in sk if x]
+    print(f"monster AI: {gb_own} GB-only monsters use their own GB skill slots")
     lines += ["];", ""]
+    lines += skill_frame_lines(gb_skill_raw, gb_models, mon_skills)
     print(f"monster AI: {len(ai_names)} scripts, {with_ai} of {len(used)} monsters scripted")
     # Navmesh per maze map (client World/Navmesh/<map>.hkt, Havok tagfile;
     # metres -> world units x100): walkable polygons the monsters stay on.

@@ -2,11 +2,16 @@
 ids it triggers) and VMonsterSpawnBox (id, monster slots, condition, pos)."""
 import re, sys
 
+# Spawn-box layers no maze activates (see spawns()).
+INACTIVE_LAYERS = {"Expert", "VeryHard"}
+# Boxes dropped for an inactive layer, summed over every spawns() call.
+SKIPPED = [0]
+
 
 def blocks(text, kind):
     out = []
     for blk in re.findall(r"<%s\b(?:(?!<%s\b).)*?</%s>" % (kind, kind, kind), text, re.S):
-        kv = dict(re.findall(r'<(m_\w+) type="\d+" value="([^"]*)"', blk))
+        kv = dict(re.findall(r'<(m_\w+|iLayerBitmask) type="\d+" value="([^"]*)"', blk))
         out.append(kv)
     return out
 
@@ -30,7 +35,16 @@ def spawns(text):
     """VMonsterSpawnBox id -> dict(monsters=[(type, id, chance)], cond, pos, rot,
     tl, br, sector, waypoint, max, random)"""
     out = {}
+    skipped = 0
     for kv in blocks(text, "VMonsterSpawnBox"):
+        # iLayerBitmask: Expert / VeryHard boxes belong to difficulty layers
+        # no maze turns on (XMaze::GetMazeLayerLevel: mask = Common |
+        # layer[tb_Maze_Info Layer_BitMask], and Layer_BitMask is 0 = Normal
+        # or 3.. = StageNN). They can reuse a Normal box's m_ID.
+        if kv.get("iLayerBitmask") in INACTIVE_LAYERS:
+            skipped += 1
+            SKIPPED[0] += 1
+            continue
         mons = []
         for i in range(1, 11):
             mid = int(kv.get(f"m_iMonsterID{i}") or 0)

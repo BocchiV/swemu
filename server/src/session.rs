@@ -183,6 +183,11 @@ pub struct Session {
     pub monster_seq: u32,
     /// Targets of the next skill hit (PRE_TARGET_LIST 6/0x36).
     pub pre_targets: Vec<u32>,
+    /// Attack frames still to land: (due ms, skill request, trigger id,
+    /// frames of the skill). handlers::due_hits sends them on time.
+    pub pending_hits: Vec<(u64, crate::proto::ActiveSkillReq, u16, u8)>,
+    /// Monster attack frames still to land on the player (maze::MonsterHit).
+    pub monster_hits: Vec<crate::maze::MonsterHit>,
     /// Hits in a row (continuous hit counter shown by the client).
     pub combo: u16,
     /// Items lying on the ground in this maze instance: (drop group, item).
@@ -196,6 +201,9 @@ pub struct Session {
     pub cleared_sectors: Vec<u32>,
     pub enabled_portals: Vec<u32>,
     pub maze_done: bool,
+    /// The tutorial maze was already offered on this connection (quest::
+    /// tutorial_redirect), so leaving it to town does not loop back.
+    pub tutorial_sent: bool,
     pub kills: u32,
     pub max_combo: u32,
     pub maze_started_ms: u64,
@@ -209,6 +217,8 @@ pub struct Session {
     pub stamina: f32,
     pub stamina_max: f32,
     pub stamina_reg: f32,
+    /// Evade / dash invincibility ends (ms clock): monster frames miss.
+    pub invuln_until: u64,
     pub sg: f32,
     pub sg_max: f32,
     pub last_regen_ms: u64,
@@ -267,6 +277,8 @@ pub async fn run(shared: Arc<Shared>, role: Role, sock: TcpStream, peer: SocketA
         monsters: Vec::new(),
         monster_seq: 0,
         pre_targets: Vec::new(),
+        pending_hits: Vec::new(),
+        monster_hits: Vec::new(),
         combo: 0,
         drops: Vec::new(),
         drop_group: 0,
@@ -280,6 +292,7 @@ pub async fn run(shared: Arc<Shared>, role: Role, sock: TcpStream, peer: SocketA
         cleared_sectors: Vec::new(),
         enabled_portals: Vec::new(),
         maze_done: false,
+        tutorial_sent: false,
         kills: 0,
         max_combo: 0,
         maze_started_ms: 0,
@@ -290,6 +303,7 @@ pub async fn run(shared: Arc<Shared>, role: Role, sock: TcpStream, peer: SocketA
         stamina: 100.0,
         stamina_max: 100.0,
         stamina_reg: 5.0,
+        invuln_until: 0,
         sg: 100.0,
         sg_max: 100.0,
         last_regen_ms: 0,
@@ -313,7 +327,9 @@ pub async fn run(shared: Arc<Shared>, role: Role, sock: TcpStream, peer: SocketA
     });
     let mut deadline = tokio::time::Instant::now() + first;
     // Maze AI tick (monsters chase / attack the player between packets).
-    let mut ai = tokio::time::interval(Duration::from_millis(200));
+    // 50 ms: skill attack frames land on time; the AI itself steps every
+    // 200 ms (maze::AI_STEP_MS).
+    let mut ai = tokio::time::interval(Duration::from_millis(50));
     ai.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {

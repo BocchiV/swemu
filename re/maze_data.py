@@ -9,6 +9,8 @@ import contextlib, io, re, struct, sys, zipfile
 import gb_maze
 import maze_spawn
 
+# Spawn boxes with m_eCreationPositionType Random: (maze, box, half x, half y).
+AREA_ROWS = []
 DATAS = os.path.join(os.environ.get("SW_CLIENT", "."), "datas", "")
 _zips = {}
 
@@ -99,6 +101,10 @@ def maze_entries(district_maps):
             mons = [m for t, m, _ in b["monsters"] if t == "Monster"]
             if mons:
                 spawn_rows.append((mid, bid, b["cond"] == "Immediate", mons[:4], b["pos"], b["rot"], b["sector"], b["waypoint"], b["step"]))
+                if b["random"]:
+                    hx, hy = abs(b["br"][0] - b["tl"][0]) / 2, abs(b["tl"][1] - b["br"][1]) / 2
+                    if hx > 1 or hy > 1:
+                        AREA_ROWS.append((mid, bid, hx, hy))
         for b in boxes(text, "VSectorBox"):
             steps = [int(b["v"](f"m_iConditionKillRatio_{i}Step") or 0) for i in range(1, 6)]
             sector_rows.append((mid, b["id"], b["rect"], b["v"]("m_eType") == "Boss", int(b["v"]("m_iSectorExitID") or 0), steps))

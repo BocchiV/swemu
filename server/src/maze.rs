@@ -31,6 +31,8 @@ pub fn reset(s: &mut Session) {
     s.monsters.clear();
     s.drops.clear();
     s.pre_targets.clear();
+    s.pending_hits.clear();
+    s.monster_hits.clear();
     s.combo = 0;
     s.spawned_boxes.clear();
     s.cleared_sectors.clear();
@@ -138,6 +140,7 @@ pub fn after_kills(s: &mut Session) {
         s.cleared_sectors.push(sector);
         info!(conn = s.id, key, sector, boss, exit, "sector cleared");
         s.send(MAIN_MAZE, 0x52, proto::sector_clear(sector));
+        crate::quest::on_sector_clear(s, sector);
         if exit != 0 && !s.enabled_portals.contains(&exit) {
             s.enabled_portals.push(exit);
         }
@@ -193,6 +196,7 @@ fn finish_maze(s: &mut Session) {
     s.maze_done = true;
     let secs = ((now(s).saturating_sub(s.maze_started_ms)) / 100) as u32;
     let (exp, money) = proto::maze_reward(spot.map, s.level);
+    let exp = s.shared.cfg.scale_exp(exp);
     let rank = proto::clear_rank(secs / 10, s.kills);
     let db = s.shared.db.lock().unwrap();
     let (level, cur) = db.level_exp(character).unwrap_or((1, 0));
@@ -208,6 +212,7 @@ fn finish_maze(s: &mut Session) {
     if new_level != level {
         level_up(s, character, new_level);
     }
+    crate::quest::on_maze_cleared(s, character, spot.map);
 }
 
 /// Level changed: tell the client and refill HP at the new maximum.
@@ -339,6 +344,8 @@ fn regen(s: &mut Session) {
 /// 200 ms tick: monsters that see the player walk to them and attack.
 pub fn tick(s: &mut Session) {
     regen(s);
+    crate::handlers::due_hits(s);
+    due_monster_hits(s);
     let (Some(character), Some(pos)) = (s.character_id, s.player_pos) else { return };
     if s.monsters.is_empty() || s.maze_done {
         return;
@@ -351,17 +358,29 @@ pub fn tick(s: &mut Session) {
     s.last_ai_ms = t;
     let map_instance = s.map_instance.unwrap_or(0);
     let level = s.level;
+    let class = s.class;
     let dead = s.dead;
     let god = s.god;
+    let invuln_until = s.invuln_until;
     let mut hp_left = s.player_hp;
     let mut out: Vec<(u8, u8, Vec<u8>)> = Vec::new();
     let mut hits: Vec<(u32, i64)> = Vec::new();
+    let mut monster_hits: Vec<MonsterHit> = Vec::new();
     let mut roll = (t as u32).wrapping_mul(2654435761) ^ s.monster_seq;
     let nav_key = s.spot.map_or(0, |sp| proto::spawn_key(sp.map));
     for m in s.monsters.iter_mut().filter(|m| m.hp > 0 && m.counts) {
+        // Flinching (hit reaction): no move / attack packets until it ends.
+        if t < m.stun_until {
+            continue;
+        }
         let d = dist(m.pos, pos);
         if !m.aggro && !dead && d <= m.sight {
             m.aggro = true;
+            // A beat to react before the first swing (the FSM passes
+            // SELECT_ACTION first); otherwise every monster in sight hit the
+            // player on the same tick it noticed them.
+            m.next_act = m.next_act.max(t + 900 + u64::from(roll % 900));
+            roll = roll.wrapping_mul(1103515245).wrapping_add(12345);
             out.push((MAIN_MONSTER, 0x22, proto::monster_target(m.actor, character)));
         }
         if !m.aggro || dead {
@@ -422,16 +441,32 @@ pub fn tick(s: &mut Session) {
         roll = roll.wrapping_mul(1103515245).wrapping_add(12345);
         let saved = m.skill;
         m.skill = skill;
-        let dmg = proto::monster_damage(m, level, roll >> 8);
+        let dmg = proto::monster_damage(m, class, level, roll >> 8);
         m.skill = saved;
-        if !god {
-            hp_left = (hp_left - dmg).max(0);
-        }
         out.push((MAIN_SKILL, 0x10, proto::monster_skill_bt(m.actor, skill, m.pos, m.rot)));
-        out.push((MAIN_SKILL, 0x13, proto::monster_hit_bt(m.actor, skill, m.pos, m.rot, character, dmg, hp_left)));
-        hits.push((m.actor, dmg));
-        if hp_left == 0 {
-            break;
+        // The damage lands on the skill's attack frames (client ActionData),
+        // shared between them; unknown skills hit at once.
+        let frames = proto::skill_frames(skill);
+        if frames.is_empty() {
+            if t < invuln_until {
+                continue;
+            }
+            if !god {
+                hp_left = (hp_left - dmg).max(0);
+            }
+            out.push((MAIN_SKILL, 0x13, proto::monster_hit_bt(m.actor, skill, m.pos, m.rot, character, dmg, hp_left)));
+            hits.push((m.actor, dmg));
+            if hp_left == 0 {
+                break;
+            }
+        } else {
+            let share = (dmg / frames.len() as i64).max(1);
+            // The frame hits inside the skill's attack area (ActionData
+            // tagATTACK_RANGE), not its AI approach range.
+            let hit_reach = proto::skill_reach(skill).unwrap_or(reach + m.radius);
+            for &(trigger, ms) in frames {
+                monster_hits.push(MonsterHit { due: t + u64::from(ms), actor: m.actor, skill, trigger, dmg: share, reach: hit_reach });
+            }
         }
     }
     // Bodies do not overlap (collision radius): monsters that crowd the
@@ -439,7 +474,7 @@ pub fn tick(s: &mut Session) {
     // new place so the client shows them side by side.
     for i in proto::separate(nav_key, &mut s.monsters) {
         let m = &s.monsters[i];
-        if !m.moving {
+        if !m.moving && t >= m.stun_until {
             out.push((MAIN_MOVE, 0x04, proto::move_stop_bt(m.actor, map_instance, m.pos, m.rot)));
         }
     }
@@ -448,6 +483,63 @@ pub fn tick(s: &mut Session) {
     }
     for (attacker, dmg) in hits {
         hurt(s, character, attacker, dmg);
+    }
+    s.monster_hits.extend(monster_hits);
+}
+
+/// Player body radius + slack on top of a swing's reach before a frame
+/// counts as dodged.
+const DODGE_MARGIN: f32 = 90.0;
+
+/// Length of a monster's hit reaction (damage motion 0x0F / 0x10).
+const HITSTUN_MS: u64 = 500;
+
+/// A monster attack frame still to land on the player.
+#[derive(Debug, Clone, Copy)]
+pub struct MonsterHit {
+    pub due: u64,
+    pub actor: u32,
+    pub skill: u32,
+    pub trigger: u16,
+    pub dmg: i64,
+    /// Skill reach + body radius at the swing: a player further away than
+    /// this (plus a margin) when the frame lands has dodged it.
+    pub reach: f32,
+}
+
+/// Monster attack frames whose time has come: the attacker must still be
+/// alive; the hit carries the frame's trigger id (6/0x13).
+fn due_monster_hits(s: &mut Session) {
+    if s.monster_hits.is_empty() {
+        return;
+    }
+    let Some(character) = s.character_id else { return };
+    let t = now(s);
+    let due: Vec<MonsterHit> = s.monster_hits.iter().copied().filter(|h| h.due <= t).collect();
+    s.monster_hits.retain(|h| h.due > t);
+    for h in due {
+        if s.dead {
+            s.monster_hits.clear();
+            return;
+        }
+        let Some(m) = s.monsters.iter().find(|m| m.actor == h.actor && m.hp > 0) else { continue };
+        let (pos, rot) = (m.pos, m.rot);
+        // The frame lands where the player is now: one who ran out of the
+        // swing's reach takes nothing (CheckSkillTarget tests the attack
+        // area at the frame, not at the skill start).
+        if s.player_pos.is_some_and(|p| dist(pos, p) > h.reach + DODGE_MARGIN) {
+            continue;
+        }
+        // Evading (ActionData B_Evade / B_Special_Evade 'Invincible' event,
+        // 0.5-0.7 s): the swing passes through.
+        if t < s.invuln_until {
+            continue;
+        }
+        let hp_left = if s.god { s.player_hp } else { (s.player_hp - h.dmg).max(0) };
+        let req = proto::ActiveSkillReq { skill: h.skill, pos, rot };
+        let hit = proto::Hit { actor: character, damage: h.dmg, hp: hp_left };
+        s.send(MAIN_SKILL, 0x13, proto::action_skill_bt(h.actor, &req, &[hit], 0, h.trigger));
+        hurt(s, character, h.actor, h.dmg);
     }
 }
 
@@ -490,7 +582,12 @@ fn holds(m: &proto::Monster, conds: &[(u8, u8, i32)], dist: f32, t: u64, roll: u
 /// is off cooldown) is used. Returns (slot index, skill id, its reach);
 /// skill 0 = idle action. Monsters without a script use their first slot.
 fn pick_skill(m: &proto::Monster, dist: f32, t: u64, roll: u32) -> (usize, u32, f32) {
-    let reach = |skill: u32| proto::skill_row(skill).map_or(m.range, |s| f32::from(s.3.max(150)).min(900.0));
+    // Close in to the skill's AI range (tb_Skill Skill_Range_Max), but never
+    // farther than its attack area reaches, or the swing hits air.
+    let reach = |skill: u32| {
+        let ai = proto::skill_row(skill).map_or(m.range, |s| f32::from(s.3.max(150)).min(900.0));
+        proto::skill_reach(skill).map_or(ai, |r| ai.min((r * 0.85).max(120.0)))
+    };
     let first = (0usize, m.skills[0].max(m.skill), m.range);
     let Some(ai) = ai_def(m) else { return first };
     let mut r = roll;
@@ -529,18 +626,32 @@ fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+/// Facing from `from` to `to` in client degrees: 0 = -y (math yaw + 90;
+/// measured from the player's own 6/0x08 rot vs its walking direction).
 fn yaw(from: [f32; 3], to: [f32; 3]) -> f32 {
-    (to[1] - from[1]).atan2(to[0] - from[0]).to_degrees()
+    (to[1] - from[1]).atan2(to[0] - from[0]).to_degrees() + 90.0
 }
 
 /// Remember the attacker for the aggro check.
 pub fn monsters_hit(s: &mut Session, actors: &[u32]) {
     let t = now(s);
+    let mut flinched = Vec::new();
     for m in s.monsters.iter_mut().filter(|m| actors.contains(&m.actor)) {
         m.attacked = true;
+        // CMover::IsDamageMotionDisplay: Monster_Defence_Type 0 plays the
+        // damage motion on every hit (GetDamageMotion 0x0F/0x10); the motion
+        // replaces the current action, so its remaining attack frames never
+        // land (CUser/CMonster ActionProcess runs off the current action).
+        if m.defence == 0 && m.hp > 0 {
+            m.stun_until = t + HITSTUN_MS;
+            m.moving = false;
+            m.next_act = m.next_act.max(m.stun_until + 200);
+            flinched.push(m.actor);
+        }
         if !m.aggro {
             m.aggro = true;
             m.next_act = m.next_act.max(t + 800);
         }
     }
+    s.monster_hits.retain(|h| !flinched.contains(&h.actor));
 }

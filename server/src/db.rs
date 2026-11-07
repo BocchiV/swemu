@@ -9,8 +9,8 @@ pub struct Db {
     conn: Connection,
 }
 
-/// Current schema layout (see `migrate_v2` and docs/database.md).
-pub const SCHEMA_VERSION: i64 = 2;
+/// Current schema layout (see `migrate_v2`, `migrate_v3` and docs/database.md).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// v2 tables, in dependency order. Column order: identity, owner, content,
 /// progress, currencies, bookkeeping.
@@ -82,6 +82,32 @@ CREATE TABLE skill_deck (
 ) WITHOUT ROWID;
 ";
 
+/// v3 additions: quest progress, completed episodes and cleared story mazes
+/// (per character, like the GameServer's CGocQuest / CGocRecode).
+const SCHEMA_V3: &str = "
+CREATE TABLE quest (
+  character_id    INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+  episode         INTEGER NOT NULL CHECK (episode > 0),
+  is_helper       INTEGER NOT NULL DEFAULT 0 CHECK (is_helper IN (0, 1)),
+  is_failed       INTEGER NOT NULL DEFAULT 0 CHECK (is_failed IN (0, 1)),
+  steps           BLOB    NOT NULL CHECK (length(steps) = 10),
+  accepted_at     INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (character_id, episode)
+);
+CREATE TABLE quest_done (
+  character_id    INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+  episode         INTEGER NOT NULL CHECK (episode > 0),
+  done_at         INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (character_id, episode)
+) WITHOUT ROWID;
+CREATE TABLE maze_clear (
+  character_id    INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+  maze            INTEGER NOT NULL CHECK (maze BETWEEN 1 AND 65535),
+  cleared_at      INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (character_id, maze)
+) WITHOUT ROWID;
+";
+
 /// Copy statements old -> v2 (column lists explicit, values clamped into the
 /// new CHECK ranges; orphans dropped).
 const COPY_V2: &[(&str, &str)] = &[
@@ -111,7 +137,7 @@ const COPY_V2: &[(&str, &str)] = &[
 /// one transaction; foreign keys are checked before commit.
 fn migrate_v2(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version >= SCHEMA_VERSION {
+    if version >= 2 {
         return Ok(());
     }
     // AUTOINCREMENT counters, so ids are never reused after the rebuild.
@@ -145,11 +171,48 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
     tx.execute("DELETE FROM sqlite_sequence WHERE name LIKE 'old_%'", [])?;
     let broken: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
     anyhow::ensure!(broken == 0, "schema v2 migration: {broken} foreign key violations");
-    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.execute_batch("PRAGMA user_version = 2;")?;
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    tracing::info!(version = 2, "database schema migrated");
+    Ok(())
+}
+
+/// Add the v3 quest / maze-clear tables once (user_version 2 -> 3). Existing
+/// tables are untouched; one transaction, foreign keys checked before commit.
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    anyhow::ensure!(version == 2, "schema v3 migration expects v2, found v{version}");
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(SCHEMA_V3)?;
+    let broken: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+    anyhow::ensure!(broken == 0, "schema v3 migration: {broken} foreign key violations");
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.commit()?;
     tracing::info!(version = SCHEMA_VERSION, "database schema migrated");
     Ok(())
+}
+
+/// One accepted quest episode (QUEST_LIST 21/0x02 entry): the progress step
+/// of each condition slot (tb_Quest_Episode condition order), the quest
+/// helper pin and the failed flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestProgress {
+    pub episode: u32,
+    pub steps: [u8; 10],
+    pub helper: bool,
+    pub failed: bool,
+}
+
+impl QuestProgress {
+    pub fn new(episode: u32) -> Self {
+        // New episodes show in the quest helper (tracker), like QUEST_ACCEPT
+        // tells the client (21/0x03 show_helper = 1).
+        Self { episode, steps: [0; 10], helper: true, failed: false }
+    }
 }
 
 /// Result of a username/password check.
@@ -311,6 +374,7 @@ impl Db {
             }
         }
         migrate_v2(&conn)?;
+        migrate_v3(&conn)?;
         // Start account ids at 1000 like the reconstructed server's test account.
         conn.execute(
             "INSERT INTO sqlite_sequence(name, seq) SELECT 'account', 999
@@ -319,6 +383,72 @@ impl Db {
         )?;
         conn.execute("UPDATE sqlite_sequence SET seq = 999 WHERE name = 'account' AND seq < 999", [])?;
         Ok(Self { conn })
+    }
+
+    /// Accepted quests of a character, in accept order.
+    pub fn quests(&self, character: u32) -> Result<Vec<QuestProgress>> {
+        let mut st = self.conn.prepare(
+            "SELECT episode, is_helper, is_failed, steps FROM quest WHERE character_id=?1 ORDER BY accepted_at, rowid",
+        )?;
+        let rows = st.query_map(params![character], |r| {
+            let blob: Vec<u8> = r.get(3)?;
+            let mut steps = [0u8; 10];
+            for (d, s) in steps.iter_mut().zip(blob) {
+                *d = s;
+            }
+            Ok(QuestProgress { episode: r.get(0)?, steps, helper: r.get::<_, i64>(1)? != 0, failed: r.get::<_, i64>(2)? != 0 })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Insert or update one accepted quest.
+    pub fn save_quest(&self, character: u32, q: &QuestProgress) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO quest(character_id, episode, is_helper, is_failed, steps) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(character_id, episode) DO UPDATE SET is_helper=?3, is_failed=?4, steps=?5",
+            params![character, q.episode, q.helper as i64, q.failed as i64, &q.steps[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Drop an accepted quest (give up). True if it was active.
+    pub fn delete_quest(&self, character: u32, episode: u32) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM quest WHERE character_id=?1 AND episode=?2", params![character, episode])? > 0)
+    }
+
+    /// Mark an episode completed and drop its progress row. False if it was
+    /// already completed.
+    pub fn complete_quest(&self, character: u32, episode: u32) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM quest WHERE character_id=?1 AND episode=?2", params![character, episode])?;
+        let new = tx.execute(
+            "INSERT OR IGNORE INTO quest_done(character_id, episode) VALUES (?1, ?2)",
+            params![character, episode],
+        )? > 0;
+        tx.commit()?;
+        Ok(new)
+    }
+
+    /// Completed episodes of a character.
+    pub fn completed_quests(&self, character: u32) -> Result<Vec<u32>> {
+        let mut st = self.conn.prepare("SELECT episode FROM quest_done WHERE character_id=?1 ORDER BY episode")?;
+        let rows = st.query_map(params![character], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Record a cleared maze. True the first time.
+    pub fn mark_maze_cleared(&self, character: u32, maze: u16) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO maze_clear(character_id, maze) VALUES (?1, ?2)",
+            params![character, maze],
+        )? > 0)
+    }
+
+    /// Mazes a character has cleared, by id.
+    pub fn cleared_mazes(&self, character: u32) -> Result<Vec<u16>> {
+        let mut st = self.conn.prepare("SELECT maze FROM maze_clear WHERE character_id=?1 ORDER BY maze")?;
+        let rows = st.query_map(params![character], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Schema version (PRAGMA user_version).
@@ -1359,6 +1489,62 @@ mod tests {
     }
 
     #[test]
+    fn quest_progress_round_trip() {
+        let db = Db::open(":memory:").unwrap();
+        let acc = db.login_or_register("q").unwrap();
+        db.conn
+            .execute("INSERT INTO character(account_id, slot, name, class) VALUES (?1, 1, 'qc', 1)", params![acc])
+            .unwrap();
+        let ch = db.conn.last_insert_rowid() as u32;
+        let mut q = QuestProgress::new(100020);
+        db.save_quest(ch, &q).unwrap();
+        db.save_quest(ch, &QuestProgress::new(100025)).unwrap();
+        q.steps[0] = 3;
+        q.helper = true;
+        db.save_quest(ch, &q).unwrap();
+        let all = db.quests(ch).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0], q, "update keeps accept order");
+        assert!(db.complete_quest(ch, 100020).unwrap());
+        assert!(!db.complete_quest(ch, 100020).unwrap(), "second completion is a no-op");
+        assert_eq!(db.quests(ch).unwrap().iter().map(|q| q.episode).collect::<Vec<_>>(), [100025]);
+        assert_eq!(db.completed_quests(ch).unwrap(), [100020]);
+        assert!(db.delete_quest(ch, 100025).unwrap());
+        assert!(!db.delete_quest(ch, 100025).unwrap());
+        assert!(db.mark_maze_cleared(ch, 21112).unwrap());
+        assert!(!db.mark_maze_cleared(ch, 21112).unwrap());
+        db.mark_maze_cleared(ch, 21111).unwrap();
+        assert_eq!(db.cleared_mazes(ch).unwrap(), [21111, 21112]);
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_keeping_rows() {
+        let path = std::env::temp_dir().join(format!("swemu-v3-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            // A v2 database as the previous release left it.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_V2).unwrap();
+            c.execute_batch(
+                "INSERT INTO account(id, name) VALUES (1000, 'v2');
+                 INSERT INTO character(id, account_id, slot, name, class) VALUES (7, 1000, 1, 'c7', 1);
+                 INSERT INTO item(character_id, storage, slot, item_id) VALUES (7, 2, 0, 1);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.items(7).unwrap().len(), 1);
+        db.save_quest(7, &QuestProgress::new(100020)).unwrap();
+        drop(db);
+        let db = Db::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(db.quests(7).unwrap().len(), 1, "reopening keeps v3 data");
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn migrates_old_schema() {
         let path = std::env::temp_dir().join(format!("swemu-mig-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -1398,8 +1584,13 @@ mod tests {
         assert!(db.conn.execute("UPDATE character SET level=0 WHERE id=?1", params![ch]).is_err());
         // Orphans are refused, deleting a character removes all its rows.
         assert!(db.conn.execute("INSERT INTO item(character_id, storage, slot, item_id) VALUES (999999, 2, 1, 1)", []).is_err());
+        db.save_quest(ch, &QuestProgress::new(100020)).unwrap();
+        db.complete_quest(ch, 100001).unwrap();
+        db.mark_maze_cleared(ch, 21111).unwrap();
+        assert!(db.conn.execute("INSERT INTO quest(character_id, episode, steps) VALUES (?1, 5, x'00')", params![ch]).is_err());
+        assert!(db.conn.execute("INSERT INTO maze_clear(character_id, maze) VALUES (999999, 1)", []).is_err());
         assert!(db.delete_character(acc, ch).unwrap());
-        for t in ["item", "skill", "skill_deck", "buyback"] {
+        for t in ["item", "skill", "skill_deck", "buyback", "quest", "quest_done", "maze_clear"] {
             let n: i64 = db.conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
             assert_eq!(n, 0, "{t}");
         }
