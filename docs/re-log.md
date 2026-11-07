@@ -184,6 +184,18 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
 - Unicorn: 755/755 bytes, err 0 (e2e_client.py both modes). Server checks the info request is for the character
   the world connection entered with.
 
+## Character position persistence
+
+On explicit CHARACTER_GOBACK_LOBBY 3/0x60 from the game world, the server saves the active
+character's current map, finite XYZ, rotation, and jump when both the live Spot and player
+position are known. The per-character values are nullable columns added by schema v3; existing
+characters start without a saved location. SELECT_CHARACTER then sends the saved Spot through
+the existing world ticket and CHARACTER_INFO_RES spawn path, or uses `start_spot()` when no
+location exists. The initial spawn position is installed after maze reset so an immediate
+explicit logout has a valid location to save. `re/e2e_client.py --position-persistence-only`
+exercises the start fallback, immediate town logout, moved XYZ, and saved Spot restoration
+on map 21211, then returns before the monster/drop/AI scenarios.
+
 ## Entering the world: SKILL_LOAD_INFO 6/0x70 + ping — 2.3.34.7 (verified statically + client readers)
 - CHARACTER_INFO_RES (FUN_180da1170) does not switch scenes: it only writes "LoadingScene"/"PlayScene" into the
   scene manager's pending name (DAT_1819671e0 +0x58). The only code that applies the pending name is

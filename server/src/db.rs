@@ -9,8 +9,8 @@ pub struct Db {
     conn: Connection,
 }
 
-/// Current schema layout (see `migrate_v2` and docs/database.md).
-pub const SCHEMA_VERSION: i64 = 2;
+/// Current schema layout (see `migrate_v2` and `migrate_v3`).
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// v2 tables, in dependency order. Column order: identity, owner, content,
 /// progress, currencies, bookkeeping.
@@ -111,7 +111,7 @@ const COPY_V2: &[(&str, &str)] = &[
 /// one transaction; foreign keys are checked before commit.
 fn migrate_v2(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version >= SCHEMA_VERSION {
+    if version >= 2 {
         return Ok(());
     }
     // AUTOINCREMENT counters, so ids are never reused after the rebuild.
@@ -145,12 +145,35 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
     tx.execute("DELETE FROM sqlite_sequence WHERE name LIKE 'old_%'", [])?;
     let broken: i64 = tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
     anyhow::ensure!(broken == 0, "schema v2 migration: {broken} foreign key violations");
-    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.execute_batch("PRAGMA user_version = 2;")?;
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    tracing::info!(version = SCHEMA_VERSION, "database schema migrated");
+    tracing::info!(version = 2, "database schema migrated");
     Ok(())
 }
+
+/// Add optional per-character spawn location without rebuilding existing rows.
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 3 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE character ADD COLUMN location_map INTEGER;
+         ALTER TABLE character ADD COLUMN location_x REAL;
+         ALTER TABLE character ADD COLUMN location_y REAL;
+         ALTER TABLE character ADD COLUMN location_z REAL;
+         ALTER TABLE character ADD COLUMN location_rot REAL;
+         ALTER TABLE character ADD COLUMN location_jump INTEGER;
+         PRAGMA user_version = 3;
+         COMMIT;",
+    )?;
+    tracing::info!(version = 3, "database schema migrated");
+    Ok(())
+}
+
+
 
 /// Result of a username/password check.
 #[derive(Debug, PartialEq, Eq)]
@@ -311,6 +334,7 @@ impl Db {
             }
         }
         migrate_v2(&conn)?;
+        migrate_v3(&conn)?;
         // Start account ids at 1000 like the reconstructed server's test account.
         conn.execute(
             "INSERT INTO sqlite_sequence(name, seq) SELECT 'account', 999
@@ -402,6 +426,57 @@ impl Db {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Last explicitly saved world location for one character.
+    pub(crate) fn character_location(&self, character: u32) -> Result<Option<CharacterLocation>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT location_map, location_x, location_y, location_z, location_rot, location_jump
+                 FROM character WHERE id=?1",
+                params![character],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<u16>>(0)?,
+                        r.get::<_, Option<f64>>(1)?,
+                        r.get::<_, Option<f64>>(2)?,
+                        r.get::<_, Option<f64>>(3)?,
+                        r.get::<_, Option<f64>>(4)?,
+                        r.get::<_, Option<u32>>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(map, x, y, z, rot, jump)| match (map, x, y, z, rot, jump) {
+            (Some(map), Some(x), Some(y), Some(z), Some(rot), Some(jump)) => Some(CharacterLocation {
+                map,
+                pos: [x as f32, y as f32, z as f32],
+                rot: rot as f32,
+                jump,
+            }),
+            _ => None,
+        }))
+    }
+
+    /// Save a location only after a live map and finite position are known.
+    pub(crate) fn save_character_location(
+        &self,
+        character: u32,
+        map: u16,
+        pos: [f32; 3],
+        rot: f32,
+        jump: u32,
+    ) -> Result<()> {
+        anyhow::ensure!(pos.iter().all(|v| v.is_finite()) && rot.is_finite(), "character location must be finite");
+        let changed = self.conn.execute(
+            "UPDATE character SET location_map=?1, location_x=?2, location_y=?3, location_z=?4,
+             location_rot=?5, location_jump=?6 WHERE id=?7",
+            params![map, pos[0] as f64, pos[1] as f64, pos[2] as f64, rot as f64, jump, character],
+        )?;
+        anyhow::ensure!(changed == 1, "character {character} does not exist");
+        Ok(())
+    }
+
 
     pub fn character_count(&self, account: u32) -> Result<u32> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM character WHERE account_id=?1", params![account], |r| r.get(0))?)
@@ -1045,6 +1120,14 @@ pub struct CharacterRecord {
     pub outfit: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CharacterLocation {
+    pub map: u16,
+    pub pos: [f32; 3],
+    pub rot: f32,
+    pub jump: u32,
+}
+
 /// An NPC shop purchase, already priced from the client tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShopPurchase {
@@ -1370,9 +1453,38 @@ mod tests {
         assert!(matches!(db.login_with_password("old", "pw", false).unwrap(), LoginOutcome::Registered(_)));
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
         drop(db);
-        // Reopening keeps v2 and the data.
+        let _ = std::fs::remove_file(&path);
+    }
+
+
+    #[test]
+    fn migrates_v2_character_location() {
+        let path = std::env::temp_dir().join(format!("swemu-v2-mig-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA_V2).unwrap();
+            c.execute_batch(
+                "PRAGMA user_version = 2;
+                 INSERT INTO account(id, name) VALUES (1000, 'old');
+                 INSERT INTO character(account_id, slot, name, class, level)
+                 VALUES (1000, 1, 'kept', 1, 42);",
+            )
+            .unwrap();
+        }
         let db = Db::open(path.to_str().unwrap()).unwrap();
-        assert!(matches!(db.login_with_password("old", "pw", false).unwrap(), LoginOutcome::Ok(_)));
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        let account = db.login_or_register("old").unwrap();
+        let characters = db.characters(account).unwrap();
+        assert_eq!(characters.len(), 1);
+        assert_eq!(characters[0].level, 42);
+        let character = characters[0].id;
+        assert_eq!(db.character_location(character).unwrap(), None);
+        let pos = [123.25, -456.5, 78.75];
+        let rot = 82.5;
+        let jump = 2121101;
+        db.save_character_location(character, 21211, pos, rot, jump).unwrap();
+        assert_eq!(db.character_location(character).unwrap(), Some(CharacterLocation { map: 21211, pos, rot, jump }));
         drop(db);
         let _ = std::fs::remove_file(&path);
     }

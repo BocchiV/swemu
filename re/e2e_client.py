@@ -110,6 +110,15 @@ def parse_login_result(p):
     return account, err, msg, auth, session
 
 
+def character_world_location(p):
+    # Position block is 26 bytes; the fixed response tail adds 102 bytes.
+    offset = len(p) - 128
+    return (
+        struct.unpack_from("<H", p, offset)[0],
+        struct.unpack_from("<fff", p, offset + 10),
+        struct.unpack_from("<f", p, offset + 22)[0],
+    )
+
 def main():
     argv = sys.argv[1:]
     mode = 3 if "--aes" in argv else 1
@@ -315,6 +324,54 @@ def main():
     m, sub, p = w3.recv()
     assert (m, sub) == (3, 0x32), (m, sub)
     assert struct.unpack_from("<I", p, 0)[0] == cid2, "info row must be the selected character"
+    location_map, location_xyz, _ = character_world_location(p)
+    expected_start = struct.unpack("<fff", struct.pack("<fff", 10430.798, 10258.951, 90.452))
+    assert location_xyz == expected_start, "unsaved character keeps the start position"
+    if "--position-persistence-only" in argv:
+        def reenter_after_logout(wait_for_world_ready=True):
+            g.send(3, 0x13, struct.pack("<IIBII", cid2, 0, 0, 0, 0))
+            m, sub, p = g.recv()
+            whost_saved, wport_saved, saved_instance, result = select_result(p)
+            assert (m, sub, result) == (3, 0x14, 0), (m, sub, result)
+            world = ClientConn(emu, whost_saved, wport_saved, mode)
+            world.send(3, 0x21, struct.pack("<IIQBQ", account, 0, saved_instance, 1, 0))
+            m, sub, p = world.recv()
+            assert (m, sub) == (3, 0x22) and struct.unpack_from("<I", p, 0)[0] == 0, (m, sub, p[:4])
+            world.send(3, 0x31, struct.pack("<IB", cid2, 1))
+            m, sub, p = world.recv()
+            assert (m, sub) == (3, 0x32), (m, sub)
+            if wait_for_world_ready:
+                while True:
+                    m, sub, _ = world.recv()
+                    if (m, sub) == (6, 0x70):
+                        break
+            return world, p
+
+        while True:
+            m, sub, _ = w3.recv()
+            if (m, sub) == (6, 0x70):
+                break
+        w3.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
+        m, sub, p = w3.recv()
+        assert (m, sub) == (3, 0x60), (m, sub, p)
+        world, p = reenter_after_logout()
+        location_map, location_xyz, _ = character_world_location(p)
+        assert location_map == 10003
+        assert location_xyz == expected_start
+        saved_pos = (321.25, -654.5, 99.125)
+        world.send(6, 0x47, struct.pack("<fff", *saved_pos) + bytes(16))
+        m, sub, _ = world.recv()
+        assert (m, sub) == (6, 0x48), (m, sub)
+        world.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
+        m, sub, _ = world.recv()
+        assert (m, sub) == (3, 0x60), (m, sub)
+        world, p = reenter_after_logout(wait_for_world_ready=False)
+        location_map, location_xyz, _ = character_world_location(p)
+        assert (location_map, location_xyz) == (10003, saved_pos), (
+            location_map, location_xyz
+        )
+        print("[ok] immediate logout keeps start spawn; moved XYZ survives logout/reselect")
+        w3 = world
     print(f"[ok] CHARACTER_INFO_REQ -> CHARACTER_INFO_RES {len(p)} bytes (character {cid2})")
     # Zenny = 2nd u64 after the position; 78 bytes of tail follow it
     # (u8 x4, u32 x2, u64 x3, str8 " ", u64, u32 x3, u64 x2, u8 x3).
@@ -582,11 +639,45 @@ def main():
         m, sub, p = w4.recv()
         assert (m, sub) == (3, 0x32), (m, sub)
         assert struct.pack("<H", 21211) + struct.pack("<Q", minst4) in p, "CHARACTER_INFO places the player in the maze"
+        maze_rot = character_world_location(p)[2]
         while True:  # quest lists + skills
             m, sub, _ = w4.recv()
             if (m, sub) == (6, 0x70):
                 break
         print("[ok] maze 21211 entered: 4/0x02 -> reconnect -> CHARACTER_INFO in map 21211 (GM /level 10)")
+
+        if "--position-persistence-only" in argv:
+            saved_maze_pos = (321.25, -654.5, 99.125)
+            w4.send(6, 0x47, struct.pack("<fff", *saved_maze_pos) + bytes(16))
+            m, sub, p = w4.recv()
+            assert (m, sub) == (6, 0x48) and struct.unpack_from("<I", p, 0)[0] == cid2, (m, sub, p)
+            w4.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
+            m, sub, p = w4.recv()
+            assert (m, sub) == (3, 0x60), (m, sub, p)
+            g.send(3, 0x13, struct.pack("<IIBII", cid2, 0, 0, 0, 0))
+            m, sub, p = g.recv()
+            whost_saved, wport_saved, minst_saved, res_saved = select_result(p)
+            assert (m, sub, res_saved) == (3, 0x14, 0) and (minst_saved >> 32) & 0xFFFF == 21211, (m, sub, res_saved, hex(minst_saved))
+            assert struct.unpack_from("<I", p, 12)[0] == 2121101, "reselect restores the maze jump"
+            _, host_end = str8(p, 36)
+            assert struct.unpack_from("<f", p, host_end + 24)[0] == maze_rot, "reselect restores the maze rotation"
+            world = ClientConn(emu, whost_saved, wport_saved, mode)
+            world.send(3, 0x21, struct.pack("<IIQBQ", account, 0, minst_saved, 1, 0))
+            m, sub, p = world.recv()
+            assert (m, sub) == (3, 0x22) and struct.unpack_from("<I", p, 0)[0] == 0, (m, sub, p[:4])
+            world.send(3, 0x31, struct.pack("<IB", cid2, 1))
+            m, sub, p = world.recv()
+            assert (m, sub) == (3, 0x32), (m, sub, p)
+            location_map, location_xyz, location_rot = character_world_location(p)
+            assert location_map == 21211, "logout restores the saved map"
+            assert location_xyz == saved_maze_pos, "logout restores exact saved XYZ"
+            assert location_rot == maze_rot, "logout restores rotation"
+            while True:
+                m, sub, _ = world.recv()
+                if (m, sub) == (6, 0x70):
+                    break
+            print("[ok] position persistence restores map 21211, XYZ, rotation, and jump")
+            return
         # Monsters fight back now: keep the scripted combat alive.
         gm_cmd(w4, "/god", {(7, 0x01)})
         # Map loaded -> NPCs + monsters; walk into check box 80101 -> 2 more.
@@ -679,6 +770,37 @@ def main():
         assert (m, sub) == (0x14, 0x02) and p == struct.pack("<QI", serial, 1), (m, sub, p)
         print("[ok] loot: picking the same drop twice is refused (result 1)")
         maze_play_checks(w4, cid2, load_mons)
+        # Save and restore the active maze position through explicit logout/reselect.
+        saved_pos = (321.25, -654.5, 99.125)
+        w4.send(6, 0x47, struct.pack("<fff", *saved_pos) + bytes(16))
+        m, sub, p = w4.recv()
+        assert (m, sub) == (6, 0x48) and struct.unpack_from("<I", p, 0)[0] == cid2, (m, sub, p)
+        w4.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
+        m, sub, p = w4.recv()
+        assert (m, sub) == (3, 0x60) and p[-1] == 1 and p[-6] == 1, (m, sub, p)
+        g.send(3, 0x13, struct.pack("<IIBII", cid2, 0, 0, 0, 0))
+        m, sub, p = g.recv()
+        whost_saved, wport_saved, minst_saved, res_saved = select_result(p)
+        assert (m, sub, res_saved) == (3, 0x14, 0) and (minst_saved >> 32) & 0xFFFF == 21211, (m, sub, res_saved, hex(minst_saved))
+        assert struct.unpack_from("<I", p, 12)[0] == 2121101, "reselect restores the maze jump"
+        _, host_end = str8(p, 36)
+        assert struct.unpack_from("<f", p, host_end + 24)[0] == maze_rot, "reselect restores the maze rotation"
+        w4_old = w4
+        w4 = ClientConn(emu, whost_saved, wport_saved, mode)
+        w4.send(3, 0x21, struct.pack("<IIQBQ", account, 0, minst_saved, 1, 0))
+        m, sub, p = w4.recv()
+        assert (m, sub) == (3, 0x22) and struct.unpack_from("<I", p, 0)[0] == 0, (m, sub, p[:4])
+        w4.send(3, 0x31, struct.pack("<IB", cid2, 1))
+        m, sub, p = w4.recv()
+        assert (m, sub) == (3, 0x32), (m, sub)
+        location_map, location_xyz, _ = character_world_location(p)
+        assert location_map == 21211, "logout restores the saved map"
+        assert location_xyz == saved_pos, "logout restores exact saved XYZ"
+        while True:
+            m, sub, _ = w4.recv()
+            if (m, sub) == (6, 0x70):
+                break
+        print("[ok] explicit logout/reselect restores map 21211 and exact saved XYZ")
         w4.send(0x11, 0x23, struct.pack("<IQiiiB", cid2, minst4, 0, 0, 0, 0))
         m, sub, p = w4.recv()
         whost5, wport5, minst5, res5 = select_result(p[:-2])
@@ -691,6 +813,9 @@ def main():
         m, sub, p = w4.recv()
         assert (m, sub) == (3, 0x60) and p[-1] == 1 and p[-6] == 1, (m, sub, p)
         print("[ok] CHARACTER_GOBACK_LOBBY 3/0x60 -> back to the character select (type 1 echoed)")
+    if gm_expected:
+        w3.replies += w4_old.replies + w4_old.side + w4.replies + w4.side
+    else:
         w3.replies += w4.replies + w4.side
     w2 = ClientConn(emu, whost, wport, mode)
     w2.send(3, 0x21, struct.pack("<IIQBQ", account, 0, minst, 1, 0))

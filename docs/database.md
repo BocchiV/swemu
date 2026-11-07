@@ -1,10 +1,10 @@
-# swemu database (SQLite, schema v2)
+# swemu database (SQLite, schema v3)
 
 One file: `run/data/swemu.db` (WAL mode: `swemu.db-wal`, `swemu.db-shm` belong to it).
-No MySQL / MSSQL. The schema lives in `server/src/db.rs` (`SCHEMA_V2`); `PRAGMA
-user_version` = 2. Older files are migrated once on start (one transaction, data
-copied column by column, foreign keys checked before commit); the AUTOINCREMENT
-counters are kept so ids are never reused. Account ids start at 1000.
+No MySQL / MSSQL. The schema lives in `server/src/db.rs` (`SCHEMA_V2` plus migrations); `PRAGMA
+user_version` = 3. Older files are migrated on start: v2 rebuilds tables transactionally,
+then v3 adds nullable character location columns in place so existing character rows/data
+remain intact. The AUTOINCREMENT counters are kept so ids are never reused. Account ids start at 1000.
 
 Connection settings: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`,
 `foreign_keys=ON`.
@@ -14,7 +14,7 @@ Connection settings: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=500
 | Table | Key | What it holds |
 |---|---|---|
 | `account` | `id` | login name, Argon2id password hash, Argon2id second password (PIN) hash, cash (NULL = start amount on first read) |
-| `character` | `id`, unique (`account_id`, `slot`), unique `name` | identity (class, class_ref, outfit, appearance), progress (level 1..255, exp), currencies (zenny NULL = start amount, ether, bp, soul_vapor), skill deck meta (deck_slots 0..6, deck_bonus = 4 x u16), `equip_seeded` (starter costume written once) |
+| `character` | `id`, unique (`account_id`, `slot`), unique `name` | identity (class, class_ref, outfit, appearance), progress (level 1..255, exp), currencies (zenny NULL = start amount, ether, bp, soul_vapor), skill deck meta (deck_slots 0..6, deck_bonus = 4 x u16), `equip_seeded` (starter costume written once), nullable last logout Spot (map, XYZ, rotation, jump; all NULL until saved) |
 | `item` | `id`, unique (`character_id`, `storage`, `slot`) | every item a character owns: storage 0 = equipped, 1.. = bags, 13 = costume bag, 255 = temporary while swapping; count >= 1 |
 | `buyback` | `id`, unique `serial` | NPC shop sell history (newest 12 kept per character) |
 | `skill` | (`character_id`, `skill_group`) | learned skill per skill group (skill id = level), divergence |
