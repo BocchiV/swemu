@@ -1128,6 +1128,9 @@ pub mod storage {
     pub const CASH: u8 = 0x0D;
     pub const NORMAL_UI: u8 = 5;
     pub const COSTUME_UI: u8 = 6;
+    /// Auxiliary bases added by the client 8/0x0F response handler.
+    pub const NORMAL_UI_AUX_BASE: u16 = 2;
+    pub const COSTUME_UI_AUX_BASE: u16 = 4;
     pub const CASH_UI: u8 = 14;
     pub const NORMAL_BANK: u8 = 0x16;
     pub const COSTUME_BANK: u8 = 0x17;

@@ -271,25 +271,22 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   the selected BankDialog view refreshes. Sorting packs rows by
   `(item_id, serial)` into slots `0..n-1`. The DB rows are account-owned and
   shared across characters; sorting does not cross accounts or storage groups.
-- Add Slots C→S `8/0x0F` carries a mode byte: `0` Normal, `1` Costume,
-  `2` Cash (unsupported). It consumes one item 837000002 per accepted use and
-  grows that bank by 12. The Desktop client's `tb_Bank_Slot_Extend.res` table
-  encodes +12-slot options and one `837000002` card per expansion. This client
-  table observation is from `C:\Users\Michael\Desktop\SW`; do not infer that
-  the server-side table is independently verified by a live UI interaction.
-  The parsed row is `(level, Normal item, count, target capacity, Costume item,
-  count, target capacity)`. [INFERENCE] `level` orders option rows, and the
-  bank's item/count/capacity triple specifies qualifying consumable and result;
-  the handler selects the target current capacity + 12. Normal and Costume cap
-  at 384; zero-valued Costume options above that target remain unselectable.
-  S→C emits item update `8/0x15`, then `8/0x0F` `{mode, auxiliary, capacity}`,
-  slot-info `8/0x0E`, and bank items `8/0x10`. The `8/0x0F` auxiliary remains
-  separate from the per-group UI auxiliaries above; its display interpretation
-  is not established.
-  E2E checks both modes, one-card consumption, and a fresh-login second
-  character observing the shared bank item serial, Zenny and capacities while
-  retaining a private wallet. These packet checks do not prove Add Slots UI
-  behavior; the Costume48 row-lock confirmation does not cover Add Slots.
+- Add Slots C→S `8/0x0F` accepts raw UI selectors `0x10` (Normal) and
+  `0x11` (Costume); `0x12` Cash remains unsupported. The server consumes one
+  `837000002` per accepted use and adds 12 slots only when the Desktop
+  client's `tb_Bank_Slot_Extend.res` has an option for the current capacity
+  plus 12. The parsed row stores level, item, count, and target capacity for
+  Normal and Costume. `[INFERENCE]` `level` orders the option rows. Normal and
+  Costume target 384; zero-valued Costume options above that remain unselectable.
+- Replies echo the raw selector in `8/0x0F` `{selector, auxiliary, capacity}`.
+  Approved-client handler `FUN_180dfa890` routes `0x10`/`0x11` to Normal/
+  Costume and adds auxiliary bases 2/4; the server encodes
+  `capacity / 12 - base`. The subsequent `8/0x0E` uses the same UI bases, then
+  bank items follow in `8/0x10`.
+- E2E exercises both raw selectors, card consumption, reply auxiliaries and
+  capacities, and fresh-login bank persistence. It remains protocol simulation;
+  the user's Costume48 row-lock confirmation does not verify the Add Slots
+  prompt's actual-client effect.
 - Item-use C→S `8/0x11` retains item 6001026 for Normal storage, adding 12
   slots per use up to 48 (E2E covers 36→48).
 - Bank stack E2E uses a valid stackable potion in isolated bank storage, splits

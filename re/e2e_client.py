@@ -1079,16 +1079,19 @@ def personal_storage_checks(emu, conn, wallet):
     assert recv(8, 0x05) == struct.pack("<BHQ", stack[0], stack[1], stack[3])
 
     card = grant(837000002, 2)
-    for mode, expected_capacity in ((0, 36), (1, 60)):
-        conn.send(8, 0x0F, bytes((mode,)))
+    for selector, option, expected_capacity in ((0x10, 0, 36), (0x11, 1, 60)):
+        conn.send(8, 0x0F, bytes((selector,)))
         update = records(recv(8, 0x15))
-        assert any(r[2] == 837000002 and r[4] == (1 if mode == 0 else 0) for r in update), update
-        assert recv(8, 0x0F) == bytes((mode, 1 if mode == 0 else 3)) + struct.pack("<H", expected_capacity)
+        assert any(r[2] == 837000002 and r[4] == (1 if option == 0 else 0) for r in update), update
+        base = 2 if selector == 0x10 else 4
+        auxiliary = expected_capacity // 12 - base
+        assert recv(8, 0x0F) == bytes((selector, auxiliary)) + struct.pack("<H", expected_capacity)
         slot_info = recv(8, 0x0E)
         capacities = {slot_info[1 + i * 4]:
                       (struct.unpack_from("<H", slot_info, 2 + i * 4)[0], slot_info[4 + i * 4])
                       for i in range(slot_info[0])}
-        assert capacities[5] == (36, 1) and capacities[6] == (expected_capacity if mode else 48, 1 if mode else 0), capacities
+        costume_capacity, costume_aux = (48, 0) if selector == 0x10 else (60, 1)
+        assert capacities[5] == (36, 1) and capacities[6] == (costume_capacity, costume_aux), capacities
         assert capacities[0x16] == (36, 0), capacities
         records(recv(8, 0x10))
         assert struct.unpack_from("<Q", recv(8, 0x21))[0] == zenny

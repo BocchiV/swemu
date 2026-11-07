@@ -29,9 +29,9 @@ aliases 0x10/0x11/0x12. ITEM_MOVE requests use those aliases and normalize
 internally; successful replies preserve the wire aliases.
 
 Initial capacities are 24/48/384. Item 6001026 adds 12 Normal-storage slots
-per use, capped at 48. Table-backed Add Slots 8/0x0F accepts request modes 0
-(Normal) and 1 (Costume), consuming one item 837000002 and adding 12 slots;
-Cash is unsupported. Do not infer unconfirmed 0x10/0x11 selector mappings.
+per use, capped at 48. Table-backed Add Slots 8/0x0F accepts raw client
+selectors 0x10 (Normal) and 0x11 (Costume), consuming one item 837000002 and
+adding 12 slots; replies echo the selector. Cash selector 0x12 is unsupported.
 Normal and Costume banks cap at 384; zero-valued Costume options above 384
 remain parsed but cannot be selected by the handler.
 After the UI auxiliary fix, the user reports that the actual client locks

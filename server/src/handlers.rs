@@ -1352,9 +1352,13 @@ fn line_up(s: &mut Session, account: u32, character: u32, st: u8) {
     }
 }
 
-/// Add Slots item-card action, table-backed Normal and Costume banks.
-fn add_storage_slots(s: &mut Session, account: u32, character: u32, mode: u8) {
-    let (storage, option) = match mode { 0 => (proto::storage::NORMAL_BANK, 0), 1 => (proto::storage::COSTUME_BANK, 1), _ => return };
+/// Add Slots item-card action; requests use raw client selectors 0x10/0x11.
+fn add_storage_slots(s: &mut Session, account: u32, character: u32, selector: u8) {
+    let (storage, option, ui_base) = match selector {
+        0x10 => (proto::storage::NORMAL_BANK, 0, proto::storage::NORMAL_UI_AUX_BASE),
+        0x11 => (proto::storage::COSTUME_BANK, 1, proto::storage::COSTUME_UI_AUX_BASE),
+        _ => return,
+    };
     let current = match s.shared.db.lock().unwrap().storage_capacity(account, storage) {
         Ok(capacity) => capacity,
         Err(error) => { warn!(conn = s.id, storage, error = %error, "add slots: capacity lookup failed"); return; }
@@ -1376,8 +1380,8 @@ fn add_storage_slots(s: &mut Session, account: u32, character: u32, mode: u8) {
     );
     let Ok(Some((used, capacity))) = result else { return; };
     s.send(MAIN_ITEM, 0x15, proto::item_update(&[used]));
-    let aux = (capacity / 12).saturating_sub(2).min(u16::from(u8::MAX)) as u8;
-    let mut response = vec![mode, aux];
+    let aux = (capacity / 12).saturating_sub(ui_base).min(u16::from(u8::MAX)) as u8;
+    let mut response = vec![selector, aux];
     response.extend_from_slice(&capacity.to_le_bytes());
     s.send(MAIN_ITEM, 0x0F, response);
     refresh_bank(s, account);
