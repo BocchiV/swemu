@@ -15,7 +15,7 @@ Also checks a wrong password is refused and a forged ticket is rejected.
 
    .venv/Scripts/python.exe e2e_client.py [--aes] [--host IP] [--port N]
 """
-import socket, struct, sys, os, time
+import socket, struct, sys, os, time, sqlite3
 from emu_wire import Emu, DLL, F_ENC1, F_ENC3, F_DEC, HDR, client_encrypt, client_login_payload
 from reader_check import check_payloads
 
@@ -134,6 +134,12 @@ def main():
     # (exact name; use a fresh test DB) and expect GM commands to work.
     gm_user = argv[argv.index("--gm-user") + 1] if "--gm-user" in argv else None
     gm_expected = gm_user is not None
+    position_persistence_only = "--position-persistence-only" in argv
+    position_failure_only = "--position-failure-only" in argv
+    test_db_path = argv[argv.index("--test-db-path") + 1] if "--test-db-path" in argv else None
+    assert not (position_persistence_only and position_failure_only), "choose only one position mode"
+    if position_failure_only:
+        assert gm_user and test_db_path, "--position-failure-only requires --gm-user and --test-db-path"
     user = gm_user or "e2e_" + os.urandom(3).hex()
     mac = "0A-1B-2C-3D-4E-5F"
 
@@ -191,9 +197,6 @@ def main():
     m, sub, p = g.recv()
     assert (m, sub, p[0]) == (3, 0x12, 0), (m, sub)
     print("[ok] CHARACTER_LIST_REQ -> CHARACTER_LIST_RES (0 characters)")
-
-    # 5. character creator: REPRESENTATIVE_CHECK, CREATE (payload from the
-    #    real client's creator), duplicate name, list, delete
     g.send(3, 0x0D, b"")
     m, sub, p = g.recv()
     assert (m, sub, p) == (3, 0x0D, b"\0\0\0\0"), (m, sub, p)
@@ -324,10 +327,52 @@ def main():
     m, sub, p = w3.recv()
     assert (m, sub) == (3, 0x32), (m, sub)
     assert struct.unpack_from("<I", p, 0)[0] == cid2, "info row must be the selected character"
-    location_map, location_xyz, _ = character_world_location(p)
     expected_start = struct.unpack("<fff", struct.pack("<fff", 10430.798, 10258.951, 90.452))
-    assert location_xyz == expected_start, "unsaved character keeps the start position"
-    if "--position-persistence-only" in argv:
+    if position_failure_only:
+        db = sqlite3.connect(test_db_path, timeout=15)
+        db.row_factory = sqlite3.Row
+        original = db.execute("SELECT location_map, location_x, location_y, location_z, location_rot, location_jump FROM character WHERE id=?", (cid2,)).fetchone()
+        assert original is not None, f"character {cid2} absent from --test-db-path"
+        trigger = f"e2e_position_fail_{cid2}"
+        try:
+            db.execute(f"""CREATE TRIGGER {trigger} BEFORE UPDATE OF location_map ON character
+                WHEN OLD.id = {int(cid2)}
+                BEGIN SELECT RAISE(FAIL, 'E2E injected location save failure'); END""")
+            db.commit()
+            while True:
+                m, sub, _ = w3.recv()
+                if (m, sub) == (6, 0x70):
+                    break
+            w3.send(6, 0x47, struct.pack("<fff", 321.25, -654.5, 99.125) + bytes(16))
+            m, sub, _ = w3.recv()
+            w3.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
+            m, sub, p = w3.recv()
+            assert (m, sub) == (3, 0x60) and p[-1] == 0, (m, sub, p)
+            w3.send(1, 0x06, struct.pack("<QQI", 0x12345678, 0, 0))
+            m, sub, p = w3.recv()
+            assert (m, sub, p) == (1, 0x06, struct.pack("<Q", 0x12345678)), (m, sub, p)
+            db.execute(f"DROP TRIGGER {trigger}")
+            db.commit()
+            w3.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
+            m, sub, p = w3.recv()
+            assert (m, sub) == (3, 0x60) and p[-1] == 1, (m, sub, p)
+
+            db.execute("UPDATE character SET location_x='malformed' WHERE id=?", (cid2,))
+            db.commit()
+            g.send(3, 0x13, struct.pack("<IIBII", cid2, 0, 0, 0, 0))
+            m, sub, p = g.recv()
+            assert (m, sub) == (3, 0x14) and select_result(p)[3] == 50104, (m, sub, p)
+            print("[ok] save error returns ok=0 and world ping remains live; retry succeeds; malformed saved X returns SELECT_CHARACTER 50104")
+            return
+        finally:
+            db.execute("DROP TRIGGER IF EXISTS " + trigger)
+            db.execute("""UPDATE character SET location_map=?, location_x=?, location_y=?, location_z=?,
+                location_rot=?, location_jump=? WHERE id=?""",
+                (*tuple(original), cid2))
+            db.commit()
+            db.close()
+        print("POSITION PERSISTENCE ERROR E2E OK")
+    if position_persistence_only:
         def reenter_after_logout(wait_for_world_ready=True):
             g.send(3, 0x13, struct.pack("<IIBII", cid2, 0, 0, 0, 0))
             m, sub, p = g.recv()
@@ -645,39 +690,39 @@ def main():
             if (m, sub) == (6, 0x70):
                 break
         print("[ok] maze 21211 entered: 4/0x02 -> reconnect -> CHARACTER_INFO in map 21211 (GM /level 10)")
-
-        if "--position-persistence-only" in argv:
-            saved_maze_pos = (321.25, -654.5, 99.125)
-            w4.send(6, 0x47, struct.pack("<fff", *saved_maze_pos) + bytes(16))
-            m, sub, p = w4.recv()
-            assert (m, sub) == (6, 0x48) and struct.unpack_from("<I", p, 0)[0] == cid2, (m, sub, p)
-            w4.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
-            m, sub, p = w4.recv()
-            assert (m, sub) == (3, 0x60), (m, sub, p)
-            g.send(3, 0x13, struct.pack("<IIBII", cid2, 0, 0, 0, 0))
-            m, sub, p = g.recv()
-            whost_saved, wport_saved, minst_saved, res_saved = select_result(p)
-            assert (m, sub, res_saved) == (3, 0x14, 0) and (minst_saved >> 32) & 0xFFFF == 21211, (m, sub, res_saved, hex(minst_saved))
-            assert struct.unpack_from("<I", p, 12)[0] == 2121101, "reselect restores the maze jump"
-            _, host_end = str8(p, 36)
-            assert struct.unpack_from("<f", p, host_end + 24)[0] == maze_rot, "reselect restores the maze rotation"
-            world = ClientConn(emu, whost_saved, wport_saved, mode)
-            world.send(3, 0x21, struct.pack("<IIQBQ", account, 0, minst_saved, 1, 0))
-            m, sub, p = world.recv()
-            assert (m, sub) == (3, 0x22) and struct.unpack_from("<I", p, 0)[0] == 0, (m, sub, p[:4])
-            world.send(3, 0x31, struct.pack("<IB", cid2, 1))
-            m, sub, p = world.recv()
-            assert (m, sub) == (3, 0x32), (m, sub, p)
-            location_map, location_xyz, location_rot = character_world_location(p)
-            assert location_map == 21211, "logout restores the saved map"
-            assert location_xyz == saved_maze_pos, "logout restores exact saved XYZ"
-            assert location_rot == maze_rot, "logout restores rotation"
-            while True:
-                m, sub, _ = world.recv()
-                if (m, sub) == (6, 0x70):
-                    break
-            print("[ok] position persistence restores map 21211, XYZ, rotation, and jump")
-            return
+    if position_persistence_only:
+        saved_maze_pos = (123.25, -456.5, 78.75)
+        w4.send(6, 0x47, struct.pack("<fff", *saved_maze_pos) + bytes(16))
+        m, sub, p = w4.recv()
+        assert (m, sub) == (6, 0x48) and struct.unpack_from("<I", p, 0)[0] == cid2, (m, sub, p)
+        w4.send(3, 0x60, struct.pack("<IIBI", cid2, account, 1, 0))
+        m, sub, p = w4.recv()
+        assert (m, sub) == (3, 0x60), (m, sub, p)
+        g.send(3, 0x13, struct.pack("<IIBII", cid2, 0, 0, 0, 0))
+        m, sub, p = g.recv()
+        whost_saved, wport_saved, minst_saved, res_saved = select_result(p)
+        assert (m, sub, res_saved) == (3, 0x14, 0) and (minst_saved >> 32) & 0xFFFF == 21211, (m, sub, res_saved, hex(minst_saved))
+        assert struct.unpack_from("<I", p, 12)[0] == 2121101, "reselect restores maze jump"
+        _, host_end = str8(p, 36)
+        assert struct.unpack_from("<f", p, host_end + 24)[0] == maze_rot, "reselect restores maze rotation"
+        world = ClientConn(emu, whost_saved, wport_saved, mode)
+        world.send(3, 0x21, struct.pack("<IIQBQ", account, 0, minst_saved, 1, 0))
+        m, sub, p = world.recv()
+        assert (m, sub) == (3, 0x22) and struct.unpack_from("<I", p, 0)[0] == 0, (m, sub, p[:4])
+        world.send(3, 0x31, struct.pack("<IB", cid2, 1))
+        m, sub, p = world.recv()
+        assert (m, sub) == (3, 0x32), (m, sub, p)
+        location_map, location_xyz, location_rot = character_world_location(p)
+        assert location_map == 21211, "logout restores saved map"
+        assert location_xyz == saved_maze_pos, "logout restores exact saved XYZ"
+        assert location_rot == maze_rot, "logout restores rotation"
+        while True:
+            m, sub, _ = world.recv()
+            if (m, sub) == (6, 0x70):
+                break
+        print("[ok] position persistence restores map 21211, XYZ, rotation, and jump")
+        return
+    else:
         # Monsters fight back now: keep the scripted combat alive.
         gm_cmd(w4, "/god", {(7, 0x01)})
         # Map loaded -> NPCs + monsters; walk into check box 80101 -> 2 more.

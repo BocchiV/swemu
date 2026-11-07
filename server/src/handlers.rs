@@ -529,11 +529,13 @@ fn select_character(s: &mut Session, req: SelectCharacterReq) {
         return;
     }
     let cfg = s.shared.cfg.clone();
-    let location = match s.shared.db.lock().unwrap().character_location(req.id) {
+    let location_result = s.shared.db.lock().unwrap().character_location(req.id);
+    let location = match location_result {
         Ok(location) => location,
         Err(e) => {
             warn!(conn = s.id, character = req.id, "db: {e:#}");
-            None
+            s.send(MAIN_CHARACTER, 0x14, proto::select_character_fail(proto::MSG_LOGIN_FAILED, &cfg.public_ip));
+            return;
         }
     };
     let spot = location.map_or_else(proto::start_spot, |location| proto::Spot {
@@ -855,14 +857,18 @@ fn pick_up(s: &mut Session, group: u32, serial: u64) {
 fn go_back_lobby(s: &mut Session, req: proto::GoBackLobbyReq) {
     let (Some(account), Some(character)) = (s.account_id, s.character_id) else { return };
     if let (Some(spot), Some(pos)) = (s.spot, s.player_pos) {
-        if let Err(e) = s.shared.db.lock().unwrap().save_character_location(character, spot.map, pos, spot.rot, spot.jump) {
+        let save_result = s.shared.db.lock().unwrap().save_character_location(character, spot.map, pos, spot.rot, spot.jump);
+        if let Err(e) = save_result {
             warn!(conn = s.id, account, character, "save logout location: {e:#}");
+            let cfg = s.shared.cfg.clone();
+            s.send(MAIN_CHARACTER, 0x60, proto::goback_lobby_res(character, account, &cfg.public_ip, cfg.game_port, req.kind, false));
+            return;
         }
     }
     s.shared.refresh_tickets(account);
     let cfg = s.shared.cfg.clone();
     info!(conn = s.id, account, character, kind = req.kind, "back character select");
-    s.send(MAIN_CHARACTER, 0x60, proto::goback_lobby_res(character, account, &cfg.public_ip, cfg.game_port, req.kind));
+    s.send(MAIN_CHARACTER, 0x60, proto::goback_lobby_res(character, account, &cfg.public_ip, cfg.game_port, req.kind, true));
 }
 
 /// EXIT_MAZE_REQ 17/0x23 (leave a maze: menu or escape box): back to the

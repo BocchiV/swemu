@@ -192,9 +192,20 @@ position are known. The per-character values are nullable columns added by schem
 characters start without a saved location. SELECT_CHARACTER then sends the saved Spot through
 the existing world ticket and CHARACTER_INFO_RES spawn path, or uses `start_spot()` when no
 location exists. The initial spawn position is installed after maze reset so an immediate
-explicit logout has a valid location to save. `re/e2e_client.py --position-persistence-only`
-exercises the start fallback, immediate town logout, moved XYZ, and saved Spot restoration
-on map 21211, then returns before the monster/drop/AI scenarios.
+explicit logout has a valid location to save.
+`re/e2e_client.py --position-persistence-only` exercises the start fallback,
+immediate town logout, moved XYZ, and saved Spot restoration on map 21211, then
+returns before monster/drop/AI scenarios.
+The DB-failure regression mode uses a separate isolated database path:
+
+```text
+python re/e2e_client.py --gm-user <GM_ACCOUNT> --position-failure-only --test-db-path <ISOLATED_DB>
+```
+
+It injects a failed location update, checks `3/0x60 ok=0` and a live world ping,
+retries successfully, then corrupts the saved X value and checks SELECT_CHARACTER
+returns 50104. The E2E restores the row and removes its trigger.
+
 
 ## Entering the world: SKILL_LOAD_INFO 6/0x70 + ping — 2.3.34.7 (verified statically + client readers)
 - CHARACTER_INFO_RES (FUN_180da1170) does not switch scenes: it only writes "LoadingScene"/"PlayScene" into the
