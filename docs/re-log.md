@@ -233,9 +233,9 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   which invokes the bank UI's `SetBankMoney`. The C→S `8/0x24` request has
   no `8/0x24` reply; `8/0x21` is the balance update. `CHARACTER_INFO_RES`
   field `+0x360` remains semantically unmapped and is not used for this fix.
-- E2E asserts `8/0x21` balance on open, after deposit, across a fresh
-  character-B login, after withdrawal and restoration. It verifies the shared
-  item serial in the reloaded `8/0x10` list using client-visible aliases.
+- The E2E deposits and withdraws 1 Zenny, checking wallet and bank updates,
+  then deposits 2 and asserts the nonzero `8/0x21` balance after a fresh
+  character-B login. It also verifies the shared serial in the reloaded list.
 - PlayScene activation calls `FUN_180dae520`, which sends C→S `8/0x10`.
   The server answers with `8/0x0E`, `8/0x10`, and `8/0x21`; list rows use
   aliases `0x10/0x11/0x12` and retain their slots, IDs, serials, and counts.

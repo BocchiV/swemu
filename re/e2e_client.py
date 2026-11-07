@@ -448,7 +448,7 @@ def main():
     m, sub, bank_items = w3.recv()
     assert (m, sub) == (8, 0x10), (m, sub)
     m, sub, bank_zenny = w3.recv()
-    assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", bank_zenny)[0] == 0, (m, sub, bank_zenny)
+    assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", bank_zenny)[0] == persisted_bank_zenny, (m, sub, bank_zenny)
     w3.send(8, 0x01, bytes([6, 0, 3, 1, 2, 4, 0x0D]))
     m, sub, p = w3.recv()
     assert (m, sub) == (8, 0x0E) and p[0] == 6, (m, sub, p[:1])
@@ -456,8 +456,8 @@ def main():
     assert (m, sub) == (8, 0x01), (m, sub)
     print("[ok] ITEM_INVEN_INFO 8/0x01 -> OPEN_SLOT_INFO 8/0x0E (6 groups) + empty inventory")
     # NPC shop: tb_Shop 1191 = HP potion 800004001 (Buy_Price 200, stack 50).
-    zen0 = struct.unpack_from("<Q", info_payload, zenny_off)[0]
-    assert zen0 == 1_000_000, zen0
+    zen0 = wallet
+    assert zen0 == 1_000_000 - persisted_bank_zenny, zen0
     w3.send(9, 0x03, struct.pack("<I", 0x20000005))
     m, sub, p = w3.recv()
     assert (m, sub) == (9, 0x03) and p == bytes(5), (m, sub, p)
@@ -630,7 +630,7 @@ def main():
         m, sub, bank_items = w4.recv()
         assert (m, sub) == (8, 0x10), (m, sub)
         m, sub, bank_zenny = w4.recv()
-        assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", bank_zenny)[0] == 0, (m, sub, bank_zenny)
+        assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", bank_zenny)[0] == persisted_bank_zenny, (m, sub, bank_zenny)
         w4.send(0x11, 0x31, struct.pack("<I", 80101))
         m, sub, p = w4.recv()
         assert (m, sub) == (4, 0x23) and struct.unpack_from("<H", p, 0)[0] == 2, (m, sub, p[:2])
@@ -1072,6 +1072,11 @@ def personal_storage_checks(emu, conn, wallet):
         "<BIHBBIHBH", 0x10, stack[2], 2, 0, 0x10, stack[2], 1, 0, 1))
     combined = recv(8, 0x03)
     assert len(combined) == 247
+    source_reply = (combined[4], *struct.unpack_from("<HIQH", combined, 5))
+    dest_reply = (combined[127], *struct.unpack_from("<HIQH", combined, 128))
+    assert source_reply == (0x10, 2, stack[2], split_serial, 0), source_reply
+    assert dest_reply == (0x10, 1, stack[2], stack[3], stack[4]), dest_reply
+    assert combined[121:123] == bytes(2) and combined[244:247] == bytes(3), combined[-6:]
     rows = [r for r in bank()[1] if r[0] == 0x10 and r[2] == stack[2]]
     assert len(rows) == 1 and rows[0][1] == 1 and rows[0][4] == stack[4]
     move(rows[0], stack[0], stack[1])
@@ -1109,14 +1114,19 @@ def personal_storage_checks(emu, conn, wallet):
     assert extension_caps[5] == (48, 2) and extension_caps[0x16] == (48, 0), extension_caps
     records(recv(8, 0x10))
     assert struct.unpack_from("<Q", recv(8, 0x21))[0] == 0
+    persisted_bank_zenny = 2
+    conn.send(8, 0x24, struct.pack("<BQ", 1, persisted_bank_zenny))
+    wallet_after_deposit = struct.unpack_from("<Q", recv(8, 0x20))[0]
+    assert wallet_after_deposit == wallet - persisted_bank_zenny, wallet_after_deposit
+    assert bank(request=False)[2] == persisted_bank_zenny
     errors = check_payloads(conn.replies[reply_start:], emu)
     assert not errors, f"client readers rejected personal-storage packets: {errors}"
     print("[ok] personal storage: Zenny, bank aliases/sort, stack split/combine, Add Slots Normal/Costume and item-use readers")
-    return normal[3]
+    return normal[3], persisted_bank_zenny, wallet_after_deposit
 
 
 def account_storage_fresh_login(emu, host, port, mode, user, mac, account,
-                                shost, sport, character_id, pin, bank_serial):
+                                shost, sport, character_id, pin, bank_serial, expected_bank_zenny):
     """Relog the same account and verify its account-owned bank state."""
     login = ClientConn(emu, host, port, mode)
     login.send(2, 1, client_login_payload(emu, user, "right-pass", mac))
@@ -1192,7 +1202,7 @@ def account_storage_fresh_login(emu, host, port, mode, user, mac, account,
                  for i in range(bank_count)]
     assert any(row[0] == 0x10 and row[3] == bank_serial for row in bank_rows), bank_rows
     m, sub, zenny = world.recv()
-    assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", zenny)[0] == 0
+    assert (m, sub) == (8, 0x21) and struct.unpack_from("<Q", zenny)[0] == expected_bank_zenny
     errors = check_payloads(login.replies + game.replies + world.replies, emu)
     assert not errors, f"client readers rejected fresh-login storage packets: {errors}"
     print("[ok] account bank survives fresh login: item serial, Zenny, Normal/Costume capacities")
