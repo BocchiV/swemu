@@ -914,7 +914,10 @@ pub fn storage_slots(group: u8) -> i16 {
 
 /// Serialize slot info for both the UI section and item-storage models.
 pub fn open_slot_info_with(groups: &[u8], capacities: &[(u8, u16)]) -> Vec<u8> {
-    let mut requested = groups.to_vec();
+    let mut requested = Vec::with_capacity(groups.len().saturating_add(3));
+    for &group in groups {
+        if !requested.contains(&group) { requested.push(group); }
+    }
     if groups.iter().any(|g| matches!(*g, storage::NORMAL_BANK | storage::COSTUME_BANK | storage::CASH_BANK)) {
         for group in [storage::NORMAL_UI, storage::COSTUME_UI, storage::CASH_UI] {
             if !requested.contains(&group) { requested.push(group); }
@@ -977,6 +980,18 @@ mod bank_slot_info_tests {
             entries(&expanded),
             vec![(22, 48, 0), (23, 60, 0), (24, 384, 0), (5, 48, 2), (6, 60, 1), (14, 384, 0)]
         );
+    }
+
+    #[test]
+    fn slot_info_deduplicates_and_bounds_255_group_requests() {
+        let repeated = vec![storage::NORMAL_BANK; 255];
+        let payload = open_slot_info_with(&repeated, &[(storage::NORMAL_BANK, 24)]);
+        assert_eq!(entries(&payload).len(), 4);
+
+        let all_but_cash_ui: Vec<u8> = (0..=u8::MAX).filter(|&group| group != storage::CASH_UI).collect();
+        let payload = open_slot_info_with(&all_but_cash_ui, &[(22, 24), (23, 48), (24, 384)]);
+        assert_eq!(payload[0] as usize, entries(&payload).len());
+        assert!(entries(&payload).contains(&(storage::CASH_UI, 384, 0)));
     }
 }
 
@@ -1586,6 +1601,33 @@ impl ItemMoveReq {
         end(&r)?;
         Ok(Self { src, dest })
     }
+}
+
+pub(crate) fn item_move_source_item_id(p: &[u8]) -> Result<u32, ParseError> {
+    let mut r = Reader::new(p);
+    r.u8()?;
+    Ok(r.u32()?)
+}
+
+pub(crate) fn item_combine_item_ids(p: &[u8]) -> Result<(u32, u32), ParseError> {
+    let mut r = Reader::new(p);
+    r.u8()?;
+    let src = r.u32()?;
+    r.u16()?;
+    r.u8()?;
+    r.u8()?;
+    let dest = r.u32()?;
+    r.u16()?;
+    r.u8()?;
+    r.u16()?;
+    end(&r)?;
+    Ok((src, dest))
+}
+
+pub(crate) fn item_divide_source_item_id(p: &[u8]) -> Result<u32, ParseError> {
+    let mut r = Reader::new(p);
+    r.u8()?;
+    Ok(r.u32()?)
 }
 
 /// ITEM_MOVE_MONEY 8/0x24: u8 direction (0 withdraw, 1 deposit), u64 amount.

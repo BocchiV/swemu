@@ -228,6 +228,10 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
 - The server applies valid Zenny transfers atomically. It returns the updated
   wallet in `8/0x20`, then bank capacities/items in `8/0x0E` and `8/0x10`,
   followed by the persisted bank balance in S→C `8/0x21` as one u64.
+- The `8/0x24` amount and `8/0x21` balance are u64 fields; the maximum
+  client-representable bank balance is `u64::MAX`
+  (18,446,744,073,709,551,615). Transfers and v6 migration reject totals
+  above that limit.
 - Approved-client registration `0x180db4940` maps opcode `0x821` to handler
   `0x180ddeff0`: it reads u64 via `0x18000e5e0` and calls `0x1806d80d0`,
   which invokes the bank UI's `SetBankMoney`. The C→S `8/0x24` request has
@@ -273,11 +277,13 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   shared across characters; sorting does not cross accounts or storage groups.
 - Add Slots C→S `8/0x0F` accepts raw UI selectors `0x10` (Normal) and
   `0x11` (Costume); `0x12` Cash remains unsupported. The server consumes one
-  `837000002` per accepted use and adds 12 slots only when the Desktop
-  client's `tb_Bank_Slot_Extend.res` has an option for the current capacity
-  plus 12. The parsed row stores level, item, count, and target capacity for
-  Normal and Costume. `[INFERENCE]` `level` orders the option rows. Normal and
-  Costume target 384; zero-valued Costume options above that remain unselectable.
+  `837000002` per accepted use and selects the next table-supported target
+  above current capacity within a 12-slot step; off-step migrated capacities
+  may gain fewer than 12 slots. The parsed row stores level, item, count, and
+  target capacity for Normal and Costume. `[INFERENCE]` `level` orders options.
+  Costume Add Slots options target 384; migrated capacities may exceed 384 to
+  preserve existing slots, but this does not establish UI support above 384.
+  Zero-valued Costume options above 384 remain unselectable.
 - Replies echo the raw selector in `8/0x0F` `{selector, auxiliary, capacity}`.
   Approved-client handler `FUN_180dfa890` routes `0x10`/`0x11` to Normal/
   Costume and adds auxiliary bases 2/4; the server encodes
@@ -288,8 +294,9 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   separately, the user confirmed the actual-client Add Slots prompt expands
   Normal and Costume storage. This does not establish exact visible slot counts
   after use; Cash expansion remains unsupported.
-- Item-use C→S `8/0x11` retains item 6001026 for Normal storage, adding 12
-  slots per use up to 48 (E2E covers 36→48).
+- Item-use C→S `8/0x11` retains item 6001026 for Normal storage, adding up to
+  12 slots per use, capped at 48; a final off-step increase may be smaller.
+  E2E covers 36→48.
 - Bank stack E2E uses a valid stackable potion in isolated bank storage, splits
   it into an empty aliased bank slot, checks the split and combine response
   groups plus slot/count/serial conservation, then returns and discards the

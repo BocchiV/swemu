@@ -256,8 +256,21 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
             let total = bank_balances.entry(account).or_default();
             *total = total.checked_add(balance.max(0) as u128)
                 .ok_or_else(|| anyhow::anyhow!("legacy bank balance overflow"))?;
+            anyhow::ensure!(*total <= u64::MAX as u128, "schema v6 migration: legacy bank Zenny exceeds client u64 range");
         }
     }
+    let capacity_overflow: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM storage_capacity WHERE slots < 0 OR slots > 65535)",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(!capacity_overflow, "schema v6 migration: legacy bank capacity exceeds u16");
+    let count_overflow: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM item WHERE storage IN (22,23,24) AND (count < 1 OR count > 65535))",
+        [],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(!count_overflow, "schema v6 migration: legacy bank item count exceeds u16");
     tx.execute_batch(
         "CREATE TABLE item_v6 (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1061,6 +1074,7 @@ impl Db {
         let (new_wallet, new_bank) = match direction {
             BankZennyDirection::Deposit if wallet >= amount => {
                 let Some(next) = bank.checked_add(amount as u128) else { return Ok(None) };
+                if next > u64::MAX as u128 { return Ok(None); }
                 (wallet - amount, next)
             }
             BankZennyDirection::Withdraw if bank >= amount as u128 => {
@@ -1875,6 +1889,23 @@ mod tests {
     }
 
     #[test]
+    fn bank_zenny_deposit_over_u64_preserves_both_balances() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("bank-u64").unwrap();
+        let request = NewCharacter { name: "Wallet", class: 1, appearance: [0; 4], class_ref: 0, outfit: 0 };
+        let CreateOutcome::Created { id: character, .. } = db.create_character(account, &request, 0, 4).unwrap() else { panic!() };
+        db.set_zenny(character, 100).unwrap();
+        let initial_bank = u64::MAX - 5;
+        db.conn.execute("INSERT INTO bank_zenny(account_id,balance) VALUES (?1,?2)", params![account, initial_bank.to_string()]).unwrap();
+        assert_eq!(
+            db.transfer_bank_zenny(account, character, BankZennyDirection::Deposit, 10, 0).unwrap(),
+            None
+        );
+        assert_eq!(db.zenny(character, 0).unwrap(), 100);
+        assert_eq!(db.bank_zenny_balance(account).unwrap(), initial_bank as u128);
+    }
+
+    #[test]
     fn v6_migration_handles_missing_capacity_and_rejects_unrepresentable_slots() {
         let legacy_db = || {
             let conn = Connection::open(":memory:").unwrap();
@@ -1942,6 +1973,31 @@ mod tests {
             .query_row("SELECT slot FROM item WHERE account_id=1 AND storage=22", [], |r| r.get::<_, u16>(0))
             .unwrap();
         assert_eq!((capacity, stored_slot), (31, 30));
+
+        for (invalid_setup, label) in [
+            ("INSERT INTO storage_capacity VALUES (1,22,65536)", "capacity"),
+            ("INSERT INTO item(character_id,storage,slot,item_id,count,created_at) VALUES (1,22,0,1,65536,0)", "count"),
+            ("INSERT INTO character VALUES (3,1,9223372036854775807); UPDATE character SET bank_zenny=9223372036854775807 WHERE id IN (1,2)", "bank zenny"),
+        ] {
+            let invalid = legacy_db();
+            if label == "bank zenny" {
+                invalid.execute("INSERT INTO character VALUES (3,1,9223372036854775807)", []).unwrap();
+                invalid.execute("UPDATE character SET bank_zenny=9223372036854775807 WHERE id IN (1,2)", []).unwrap();
+            } else {
+                invalid.execute(invalid_setup, []).unwrap();
+            }
+            assert!(migrate_v6(&invalid).is_err(), "{label}");
+            assert_eq!(invalid.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5, "{label}");
+            let expected_items = if label == "count" { 1 } else { 0 };
+            assert_eq!(invalid.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), expected_items, "{label}");
+            assert!(invalid.prepare("SELECT bank_zenny FROM character").is_ok(), "{label}");
+            match label {
+                "capacity" => assert_eq!(invalid.query_row("SELECT slots FROM storage_capacity", [], |r| r.get::<_, i64>(0)).unwrap(), 65536),
+                "count" => assert_eq!(invalid.query_row("SELECT count FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), 65536),
+                "bank zenny" => assert_eq!(invalid.query_row("SELECT COUNT(*) FROM character WHERE bank_zenny=9223372036854775807", [], |r| r.get::<_, i64>(0)).unwrap(), 3),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

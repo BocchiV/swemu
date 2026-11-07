@@ -16,7 +16,7 @@ Connection settings: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=500
 | `character` | `id`, unique (`account_id`, `slot`), unique `name` | identity (class, class_ref, outfit, appearance); progress (level 1..255, exp); currencies (zenny NULL = start amount, ether, bp, soul_vapor); skill deck meta (`deck_slots` 0..6; `deck_bonus`: four u16 values); `equip_seeded` (starter costume written once) |
 | `item` | `id`, unique owner/storage/slot | Character-owned storage 0 = equipped, 1+ = bags, 13 = Costume bag; account-owned storage 0x16/0x17/0x18 = Normal/Costume/Cash banks; 255 = temporary during swaps; count >= 1 |
 | `storage_capacity` | (`account_id`, `storage`) | Account-wide bank capacity keyed by storage group: 0x16 Normal (24 slots initially), 0x17 Costume (48), 0x18 Cash (384) |
-| `bank_zenny` | `account_id` | Account-wide bank Zenny balance stored as decimal text |
+| `bank_zenny` | `account_id` | Account-wide bank Zenny balance stored as decimal text; client transfer/update fields are u64 and cannot represent balances above `u64::MAX` (18,446,744,073,709,551,615) |
 | `buyback` | `id`, unique `serial` | NPC shop sell history (newest 12 kept per character) |
 | `skill` | (`character_id`, `skill_group`) | learned skill per skill group (skill id = level), divergence |
 | `skill_deck` | (`character_id`, `pos`) | deck slot with four skill IDs |
@@ -28,12 +28,15 @@ client-visible aliases 0x10/0x11/0x12. C→S `ITEM_MOVE` requests use these
 aliases; the server normalizes them for persistence and preserves them in
 successful replies.
 
-Initial capacities are 24/48/384. Item 6001026 adds 12 Normal slots per use,
-up to 48. Table-backed Add Slots (`8/0x0F`) accepts raw client selectors
-`0x10` (Normal) and `0x11` (Costume), consumes one item `837000002`, and adds
-12 slots; replies echo the selector. Cash selector `0x12` is unsupported.
-Normal and Costume banks cap at 384. Zero-valued Costume options above 384
-remain in the generated table but cannot be selected by the handler.
+Initial capacities are 24/48/384. Item 6001026 adds up to 12 Normal slots
+per use, capped at 48; the final increase may be smaller. Table-backed Add
+Slots (`8/0x0F`) accepts raw selectors `0x10` (Normal) and `0x11` (Costume),
+consumes one item `837000002`, and selects the next table-supported capacity
+above the current value within a 12-slot step. Off-step migrated capacities
+may therefore gain fewer than 12 slots. Replies echo the selector; Cash
+selector `0x12` is unsupported.
+Costume options above 384 remain in the generated table but cannot be selected
+by the handler.
 The user confirmed that Add Slots prompts expand Normal and Costume banks in
 the client. At Costume capacity 48, slots 49–72 remain locked. Cash expansion
 remains unsupported; exact visible slot counts after expansion are unconfirmed.
@@ -53,10 +56,14 @@ legacy character-owned bank rows to the owning account. For duplicate group
 and slot rows, migration processes items by character ID and then serial: the
 first keeps its slot; later rows move to the lowest free slot.
 Capacities merge by maximum and increase as needed to cover migrated item
-slots. Legacy bank-Zenny balances are summed per account. Migration fails on
-u128 overflow, an unrepresentable bank slot, or a full slot range that
-prevents collision relocation. CHECK constraints reject negative currencies,
-zero item counts, and levels outside 1..255.
+slots, so a migrated capacity can exceed 384 to preserve existing slots; 384
+is the table-backed Add Slots ceiling, not an unconditional migration cap.
+Legacy bank-Zenny balances are summed with checked u128 arithmetic and must fit
+the u64 client field. V6 aborts before replacing tables if bank capacity or
+stack count exceeds u16, a bank slot is unrepresentable, or duplicate-slot
+relocation has no free slot.
+CHECK constraints reject negative currencies, zero item counts, and levels
+outside 1..255.
 
 ## Backups
 

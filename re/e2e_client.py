@@ -1021,8 +1021,15 @@ def personal_storage_checks(emu, conn, wallet):
     normal = grant(800004001)
     second = grant(800002001)
     move(normal, 0x16, 0)
-    info, rows, _ = bank()
+    info, rows, zenny_before = bank()
     stored = next(r for r in rows if r[0] == 0x10 and r[2] == normal[2])
+    stale_before = (info, rows, zenny_before)
+    stale_item_id = normal[2] + 1
+    conn.send(8, 0x02, struct.pack(
+        "<BIHBBIHB", 0x10, stale_item_id, stored[1], 0,
+        0x16, stale_item_id, 8, 0))
+    assert recv(8, 0x02) == b"\x00"
+    assert bank() == stale_before
     costume = grant(213881001)
     cash_item = grant(6000451)
     move(costume, 0x17, 0)
