@@ -722,7 +722,7 @@ def main():
                 break
         print("[ok] position persistence restores map 21211, XYZ, rotation, and jump")
         return
-    else:
+    elif gm_expected:
         # Monsters fight back now: keep the scripted combat alive.
         gm_cmd(w4, "/god", {(7, 0x01)})
         # Map loaded -> NPCs + monsters; walk into check box 80101 -> 2 more.
@@ -860,8 +860,6 @@ def main():
         print("[ok] CHARACTER_GOBACK_LOBBY 3/0x60 -> back to the character select (type 1 echoed)")
     if gm_expected:
         w3.replies += w4_old.replies + w4_old.side + w4.replies + w4.side
-    else:
-        w3.replies += w4.replies + w4.side
     w2 = ClientConn(emu, whost, wport, mode)
     w2.send(3, 0x21, struct.pack("<IIQBQ", account, 0, minst, 1, 0))
     m, sub, p = w2.recv()
