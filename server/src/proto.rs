@@ -1706,9 +1706,9 @@ impl GoBackLobbyReq {
 /// select (LoginScene state 4); type 1/2 show LoadingScene, reconnect to the
 /// game server and open the character select (state 5). The type is echoed.
 /// ok == 0 shows UI string 0xBF6C and stays in the world.
-pub fn goback_lobby_res(actor: u32, account: u32, host: &str, port: u16, kind: u8) -> Vec<u8> {
+pub fn goback_lobby_res(actor: u32, account: u32, host: &str, port: u16, kind: u8, ok: bool) -> Vec<u8> {
     let mut w = Writer::new();
-    w.u32(actor).u32(account).str8(host).u16(port).u8(kind).u32(0).u8(1);
+    w.u32(actor).u32(account).str8(host).u16(port).u8(kind).u32(0).u8(u8::from(ok));
     w.finish()
 }
 
@@ -3246,6 +3246,14 @@ mod tests {
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn goback_lobby_response_encodes_persistence_result() {
+        let failed = goback_lobby_res(1, 2, "127.0.0.1", 25000, 1, false);
+        let succeeded = goback_lobby_res(1, 2, "127.0.0.1", 25000, 1, true);
+        assert_eq!(failed.last(), Some(&0));
+        assert_eq!(succeeded.last(), Some(&1));
     }
 
     fn wstr(s: &str) -> Vec<u8> {

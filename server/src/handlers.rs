@@ -529,7 +529,21 @@ fn select_character(s: &mut Session, req: SelectCharacterReq) {
         return;
     }
     let cfg = s.shared.cfg.clone();
-    let spot = proto::start_spot();
+    let location_result = s.shared.db.lock().unwrap().character_location(req.id);
+    let location = match location_result {
+        Ok(location) => location,
+        Err(e) => {
+            warn!(conn = s.id, character = req.id, "db: {e:#}");
+            s.send(MAIN_CHARACTER, 0x14, proto::select_character_fail(proto::MSG_LOGIN_FAILED, &cfg.public_ip));
+            return;
+        }
+    };
+    let spot = location.map_or_else(proto::start_spot, |location| proto::Spot {
+        map: location.map,
+        pos: location.pos,
+        rot: location.rot,
+        jump: location.jump,
+    });
     let map_instance = s.shared.issue_world_ticket(account, req.id, s.peer.ip(), spot, cfg.server_id);
     info!(conn = s.id, account, id = req.id, district = spot.map, "character selected; sending world address");
     let target = world_target(req.id, account, &cfg, map_instance, &spot);
@@ -842,10 +856,19 @@ fn pick_up(s: &mut Session, group: u32, serial: u64) {
 /// session key, so the account's tickets are kept alive.
 fn go_back_lobby(s: &mut Session, req: proto::GoBackLobbyReq) {
     let (Some(account), Some(character)) = (s.account_id, s.character_id) else { return };
+    if let (Some(spot), Some(pos)) = (s.spot, s.player_pos) {
+        let save_result = s.shared.db.lock().unwrap().save_character_location(character, spot.map, pos, spot.rot, spot.jump);
+        if let Err(e) = save_result {
+            warn!(conn = s.id, account, character, "save logout location: {e:#}");
+            let cfg = s.shared.cfg.clone();
+            s.send(MAIN_CHARACTER, 0x60, proto::goback_lobby_res(character, account, &cfg.public_ip, cfg.game_port, req.kind, false));
+            return;
+        }
+    }
     s.shared.refresh_tickets(account);
     let cfg = s.shared.cfg.clone();
-    info!(conn = s.id, account, character, kind = req.kind, "back to the character select");
-    s.send(MAIN_CHARACTER, 0x60, proto::goback_lobby_res(character, account, &cfg.public_ip, cfg.game_port, req.kind));
+    info!(conn = s.id, account, character, kind = req.kind, "back character select");
+    s.send(MAIN_CHARACTER, 0x60, proto::goback_lobby_res(character, account, &cfg.public_ip, cfg.game_port, req.kind, true));
 }
 
 /// EXIT_MAZE_REQ 17/0x23 (leave a maze: menu or escape box): back to the
@@ -907,8 +930,8 @@ fn character_info(s: &mut Session, req: CharacterInfoReq) {
     s.dead = false;
     let row = character_row(s, c);
     let spot = s.spot.unwrap_or_else(proto::start_spot);
-    s.player_pos = Some(spot.pos);
     crate::maze::reset(s);
+    s.player_pos = Some(spot.pos);
     info!(conn = s.id, account, character, map = spot.map, "sending character info");
     let zenny = s.shared.db.lock().unwrap().zenny(character, s.shared.cfg.start_zenny).unwrap_or(0);
     s.send(MAIN_CHARACTER, 0x32, proto::character_info_res(&row, &spot, map_instance, zenny));
