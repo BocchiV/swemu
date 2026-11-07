@@ -1088,7 +1088,7 @@ def personal_storage_checks(emu, conn, wallet):
         capacities = {slot_info[1 + i * 4]:
                       (struct.unpack_from("<H", slot_info, 2 + i * 4)[0], slot_info[4 + i * 4])
                       for i in range(slot_info[0])}
-        assert capacities[5] == (36, 1) and capacities[6] == (expected_capacity if mode else 48, 3 if mode else 2), capacities
+        assert capacities[5] == (36, 1) and capacities[6] == (expected_capacity if mode else 48, 1 if mode else 0), capacities
         assert capacities[0x16] == (36, 0), capacities
         records(recv(8, 0x10))
         assert struct.unpack_from("<Q", recv(8, 0x21))[0] == zenny
@@ -1177,7 +1177,7 @@ def account_storage_fresh_login(emu, host, port, mode, user, mac, account,
     capacities = {slot_info[1 + i * 4]:
                   (struct.unpack_from("<H", slot_info, 2 + i * 4)[0], slot_info[4 + i * 4])
                   for i in range(slot_info[0])}
-    assert capacities[5] == (48, 2) and capacities[6] == (60, 3), capacities
+    assert capacities[5] == (48, 2) and capacities[6] == (60, 1), capacities
     m, sub, bank_payload = world.recv()
     assert (m, sub) == (8, 0x10)
     bank_count = struct.unpack_from("<I", bank_payload, 0)[0]

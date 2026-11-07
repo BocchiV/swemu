@@ -247,13 +247,16 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   slot-info contains two state families: UI slot groups 5/6/14
   (Normal/Costume/Cash) and bank item-storage groups 0x16/0x17/0x18. Capacities
   for both are sourced from persisted capacity keys 0x16/0x17/0x18. Initial
-  capacities are 24/48/384; UI auxiliary values are 0/2/30 and item-storage
-  auxiliary values are 0/0/0.
-- [INFERENCE] UI auxiliary values correspond to page counts via
-  `capacity / 12 - 2`: group 5 capacities 24/36/48 map to 0/1/2, and groups
-  6/14 initial capacities 48/384 map to 2/30. Disassembly establishes that
-  auxiliary+2 is stored and the UI maxima are 2/4/32; no live UI/render
-  predicate confirming these bytes unlock rows has been verified.
+  capacities are 24/48/384; initial UI auxiliaries are 0/0/0 and bank-item
+  auxiliaries remain 0/0/0.
+- Static disassembly of `FUN_180dfa290` shows UI groups 5/6/14 pass
+  `aux+2`, `aux+4`, and `aux+32` respectively to `FUN_1806d4800`, with the
+  u16 capacity passed separately. The server therefore encodes
+  `aux = capacity / 12 - base`, using bases 2/4/32 for groups 5/6/14:
+  Normal 24/36/48 -> 0/1/2, Costume 48/60 -> 0/1, Cash 384 -> 0. The former
+  Costume 48/2 pair made the client helper receive tier 6 rather than 4,
+  consistent with the reported 72-slot display. Actual row unlocking/rendering
+  still requires live-client verification.
 - E2E asserts packet bytes, bank-list aliases, account persistence, and
   cross-character reload; actual UI rendering and row-unlock behavior remain
   unverified.
@@ -279,8 +282,9 @@ FUN_180dcd530); expect the next UNHANDLED opcodes there.
   the handler selects the target current capacity + 12. Normal and Costume cap
   at 384; zero-valued Costume options above that target remain unselectable.
   S→C emits item update `8/0x15`, then `8/0x0F` `{mode, auxiliary, capacity}`,
-  slot-info `8/0x0E`, then bank items `8/0x10`. [INFERENCE] Auxiliary follows
-  `capacity / 12 - 2`, consistent with current slot-info metadata.
+  slot-info `8/0x0E`, and bank items `8/0x10`. The `8/0x0F` auxiliary remains
+  separate from the per-group UI auxiliaries above; its display interpretation
+  is not established.
   E2E checks both modes, one-card consumption, and a fresh-login second
   character observing the shared bank item serial, Zenny and capacities while
   retaining a private wallet. Packet/UI metadata is checked; visual rendering

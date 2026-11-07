@@ -923,8 +923,8 @@ pub fn open_slot_info_with(groups: &[u8], capacities: &[(u8, u16)]) -> Vec<u8> {
     let known: Vec<(u8, u16, u8)> = requested.iter().filter_map(|&g| {
         let (storage_group, base) = match g {
             storage::NORMAL_UI => (storage::NORMAL_BANK, 2),
-            storage::COSTUME_UI => (storage::COSTUME_BANK, 2),
-            storage::CASH_UI => (storage::CASH_BANK, 2),
+            storage::COSTUME_UI => (storage::COSTUME_BANK, 4),
+            storage::CASH_UI => (storage::CASH_BANK, 32),
             _ => (g, 0),
         };
         let slots = capacities.iter().find(|(group, _)| *group == storage_group).map(|(_, n)| *n)
@@ -942,6 +942,42 @@ pub fn open_slot_info_with(groups: &[u8], capacities: &[(u8, u16)]) -> Vec<u8> {
 /// ITEM_OPEN_SLOT_INFO for fixed-capacity groups.
 pub fn open_slot_info(groups: &[u8]) -> Vec<u8> {
     open_slot_info_with(groups, &[])
+}
+
+#[cfg(test)]
+mod bank_slot_info_tests {
+    use super::*;
+
+    fn entries(payload: &[u8]) -> Vec<(u8, u16, u8)> {
+        let count = usize::from(payload[0]);
+        assert_eq!(payload.len(), 1 + count * 4);
+        (0..count)
+            .map(|index| {
+                let offset = 1 + index * 4;
+                (
+                    payload[offset],
+                    u16::from_le_bytes([payload[offset + 1], payload[offset + 2]]),
+                    payload[offset + 3],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ui_slot_aux_uses_client_group_bases() {
+        let groups = [storage::NORMAL_BANK, storage::COSTUME_BANK, storage::CASH_BANK];
+        let initial = open_slot_info_with(&groups, &[(22, 24), (23, 48), (24, 384)]);
+        assert_eq!(
+            entries(&initial),
+            vec![(22, 24, 0), (23, 48, 0), (24, 384, 0), (5, 24, 0), (6, 48, 0), (14, 384, 0)]
+        );
+
+        let expanded = open_slot_info_with(&groups, &[(22, 48), (23, 60), (24, 384)]);
+        assert_eq!(
+            entries(&expanded),
+            vec![(22, 48, 0), (23, 60, 0), (24, 384, 0), (5, 48, 2), (6, 60, 1), (14, 384, 0)]
+        );
+    }
 }
 
 /// One item as read by FUN_18001e000 (114 bytes; field order traced by running
