@@ -226,27 +226,27 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
     let bank_slots_overflow: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM item i JOIN character c ON c.id=i.character_id
-             WHERE i.storage IN (22,23,24) AND i.slot >= 65535
+             WHERE i.storage IN (22,23,24) AND i.slot >= 32767
          )",
         [],
         |row| row.get(0),
     )?;
     anyhow::ensure!(
         !bank_slots_overflow,
-        "schema v6 migration: legacy bank slot capacity exceeds u16"
+        "schema v6 migration: legacy bank slot capacity exceeds client i16"
     );
     let bank_item_count_overflow: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM item i JOIN character c ON c.id=i.character_id
              WHERE i.storage IN (22,23,24)
-             GROUP BY c.account_id,i.storage HAVING COUNT(*) > 65535
+             GROUP BY c.account_id,i.storage HAVING COUNT(*) > 32767
          )",
         [],
         |row| row.get(0),
     )?;
     anyhow::ensure!(
         !bank_item_count_overflow,
-        "schema v6 migration: legacy bank storage exceeds u16 slot capacity"
+        "schema v6 migration: legacy bank storage exceeds client i16 slot capacity"
     );
     let mut bank_balances = std::collections::HashMap::<u32, u128>::new();
     {
@@ -260,11 +260,11 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
         }
     }
     let capacity_overflow: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM storage_capacity WHERE slots < 0 OR slots > 65535)",
+        "SELECT EXISTS(SELECT 1 FROM storage_capacity WHERE slots < 0 OR slots > 32767)",
         [],
         |row| row.get(0),
     )?;
-    anyhow::ensure!(!capacity_overflow, "schema v6 migration: legacy bank capacity exceeds u16");
+    anyhow::ensure!(!capacity_overflow, "schema v6 migration: legacy bank capacity exceeds client i16");
     let count_overflow: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM item WHERE storage IN (22,23,24) AND (count < 1 OR count > 65535))",
         [],
@@ -287,7 +287,7 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
          CREATE TABLE storage_capacity_v6 (
            account_id INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE,
            storage INTEGER NOT NULL CHECK(storage IN (22,23,24)),
-           slots INTEGER NOT NULL CHECK(slots >= 0),
+           slots INTEGER NOT NULL CHECK(slots BETWEEN 0 AND 32767),
            PRIMARY KEY(account_id,storage)
          ) WITHOUT ROWID;
          CREATE TABLE bank_zenny (
@@ -554,11 +554,13 @@ impl Db {
             "INSERT OR IGNORE INTO storage_capacity(account_id,storage,slots) VALUES (?1,?2,?3)",
             params![account, storage, default],
         )?;
-        Ok(self.conn.query_row(
+        let slots: i64 = self.conn.query_row(
             "SELECT slots FROM storage_capacity WHERE account_id=?1 AND storage=?2",
             params![account, storage],
             |r| r.get(0),
-        )?)
+        )?;
+        anyhow::ensure!((0..=i16::MAX as i64).contains(&slots), "bank capacity exceeds client i16 range");
+        Ok(slots as u16)
     }
 
     pub fn consume_storage_expansion(
@@ -1944,7 +1946,7 @@ mod tests {
             let mut insert = tx
                 .prepare("INSERT INTO item(character_id,storage,slot,item_id,count,created_at) VALUES (1,22,?1,1,1,0)")
                 .unwrap();
-            for slot in 0..u16::MAX {
+            for slot in 0..32767 {
                 insert.execute(params![slot]).unwrap();
             }
         }
@@ -1956,7 +1958,10 @@ mod tests {
         tx.commit().unwrap();
         assert!(migrate_v6(&full).is_err());
         assert_eq!(full.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
-        assert_eq!(full.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), 65_536);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), 32_768);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item WHERE slot=0", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item WHERE character_id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 32_767);
+        assert_eq!(full.query_row("SELECT COUNT(*) FROM item WHERE character_id=2 AND slot=0", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         let sparse = legacy_db();
         sparse
             .execute(
@@ -1998,6 +2003,64 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn v6_migration_rejects_signed_client_capacity_overflow() {
+        for (setup, item_count, expected_capacity, expected_slot) in [
+            ("INSERT INTO storage_capacity VALUES (1,22,32768)", 0, Some(32768), None),
+            ("INSERT INTO item(character_id,storage,slot,item_id,count,created_at) VALUES (1,22,32767,1,1,0)", 1, None, Some(32767)),
+        ] {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE account(id INTEGER PRIMARY KEY);
+                 CREATE TABLE character(id INTEGER PRIMARY KEY, account_id INTEGER, bank_zenny INTEGER);
+                 CREATE TABLE item(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, character_id INTEGER, storage INTEGER,
+                     slot INTEGER, item_id INTEGER, count INTEGER, created_at INTEGER,
+                     UNIQUE(character_id, storage, slot)
+                 );
+                 CREATE TABLE storage_capacity(character_id INTEGER, storage INTEGER, slots INTEGER);
+                 INSERT INTO account VALUES (1);
+                 INSERT INTO character VALUES (1, 1, 0);
+                 PRAGMA user_version=5;",
+            )
+            .unwrap();
+            conn.execute(setup, []).unwrap();
+
+            assert!(migrate_v6(&conn).is_err());
+            assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 5);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), item_count);
+            assert!(conn.prepare("SELECT bank_zenny FROM character").is_ok());
+            if let Some(capacity) = expected_capacity {
+                assert_eq!(conn.query_row("SELECT slots FROM storage_capacity", [], |r| r.get::<_, i64>(0)).unwrap(), capacity);
+            }
+            if let Some(slot) = expected_slot {
+                assert_eq!(conn.query_row("SELECT slot FROM item", [], |r| r.get::<_, i64>(0)).unwrap(), slot);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_capacity_rejects_signed_client_overflow() {
+        let db = Db::open(":memory:").unwrap();
+        let account = db.login_or_register("capacity-signed").unwrap();
+        assert_eq!(db.storage_capacity(account, 22).unwrap(), 24);
+        db.conn.execute(
+            "UPDATE storage_capacity SET slots=32767 WHERE account_id=?1 AND storage=22",
+            params![account],
+        ).unwrap();
+        assert_eq!(db.storage_capacity(account, 22).unwrap(), 32767);
+        assert!(db.conn.execute(
+            "UPDATE storage_capacity SET slots=32768 WHERE account_id=?1 AND storage=22",
+            params![account],
+        ).is_err());
+        db.conn.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+        db.conn.execute(
+            "UPDATE storage_capacity SET slots=32768 WHERE account_id=?1 AND storage=22",
+            params![account],
+        ).unwrap();
+        assert!(db.storage_capacity(account, 22).is_err());
     }
 
     #[test]

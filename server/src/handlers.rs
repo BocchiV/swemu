@@ -1391,6 +1391,10 @@ fn add_slots_candidate(
     })
 }
 
+fn next_normal_item_capacity(current: u16) -> Option<u16> {
+    (current < 48).then(|| current.saturating_add(12).min(48))
+}
+
 /// Add Slots item-card action; requests use raw client selectors 0x10/0x11.
 fn add_storage_slots(s: &mut Session, account: u32, character: u32, selector: u8) {
     let (storage, option, ui_base) = match selector {
@@ -1880,3 +1884,15 @@ fn enter_server(s: &mut Session, req: EnterServerReq) {
     s.send(MAIN_LOGIN, 0x14, proto::enter_server_res(0, req.account_id));
 }
 
+
+#[cfg(test)]
+mod bank_capacity_tests {
+    use super::next_normal_item_capacity;
+
+    #[test]
+    fn normal_add_slots_item_never_exceeds_48_for_off_step_capacity() {
+        assert_eq!(next_normal_item_capacity(31), Some(43));
+        assert_eq!(next_normal_item_capacity(43), Some(48));
+        assert_eq!(next_normal_item_capacity(48), None);
+    }
+}

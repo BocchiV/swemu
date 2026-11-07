@@ -336,6 +336,8 @@ def main():
     # Zenny = 2nd u64 after the position; 78 bytes of tail follow it
     # (u8 x4, u32 x2, u64 x3, str8 " ", u64, u32 x3, u64 x2, u8 x3).
     info_payload, zenny_off = p, len(p) - 78 - 8
+    wallet = struct.unpack_from("<Q", info_payload, zenny_off)[0]
+    persisted_bank_zenny = 0
     # FP: the row's two i16 after the private-shop wstr; find them by value.
     assert struct.pack("<HHH", 200, 0, 0) in p, "FP 200/0 in the character row"
     open(os.path.join(os.environ.get("TEMP", "."), "swemu_charinfo.hex"), "w").write(p.hex())
@@ -436,9 +438,11 @@ def main():
         assert (m, sub) == (1, 0x06), ("non-GM must get no reply to 7/0x0A", m, sub)
         print("[ok] GM 7/0x0A from a non-GM account is ignored")
     if gm_expected:
-        bank_serial = personal_storage_checks(emu, w3, struct.unpack_from("<Q", info_payload, zenny_off)[0])
+        bank_serial, persisted_bank_zenny, wallet = personal_storage_checks(
+            emu, w3, struct.unpack_from("<Q", info_payload, zenny_off)[0])
         account_storage_fresh_login(
-            emu, host, port, mode, user, mac, account, shost, sport, cid2, pin, bank_serial)
+            emu, host, port, mode, user, mac, account, shost, sport, cid2, pin,
+            bank_serial, persisted_bank_zenny)
     w3.send(0xF1, 0x01, b"")
     m, sub, p = w3.recv()
     assert (m, sub) == (4, 0x22) and struct.unpack_from("<H", p, 0)[0] == 36 and len(p) == 2 + 36 * 49, (m, sub, p[:2], len(p))

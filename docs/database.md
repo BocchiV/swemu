@@ -15,7 +15,7 @@ Connection settings: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=500
 | `account` | `id` | login name, Argon2id password hash, Argon2id second password (PIN) hash, cash (NULL = start amount on first read) |
 | `character` | `id`, unique (`account_id`, `slot`), unique `name` | identity (class, class_ref, outfit, appearance); progress (level 1..255, exp); currencies (zenny NULL = start amount, ether, bp, soul_vapor); skill deck meta (`deck_slots` 0..6; `deck_bonus`: four u16 values); `equip_seeded` (starter costume written once) |
 | `item` | `id`, unique owner/storage/slot | Character-owned storage 0 = equipped, 1+ = bags, 13 = Costume bag; account-owned storage 0x16/0x17/0x18 = Normal/Costume/Cash banks; 255 = temporary during swaps; count >= 1 |
-| `storage_capacity` | (`account_id`, `storage`) | Account-wide bank capacity keyed by storage group: 0x16 Normal (24 slots initially), 0x17 Costume (48), 0x18 Cash (384) |
+| `storage_capacity` | (`account_id`, `storage`) | Account-wide bank capacity keyed by storage group: 0x16 Normal (24 slots initially), 0x17 Costume (48), 0x18 Cash (384); persisted capacity cannot exceed the client signed-i16 limit of 32767 |
 | `bank_zenny` | `account_id` | Account-wide bank Zenny balance stored as decimal text; client transfer/update fields are u64 and cannot represent balances above `u64::MAX` (18,446,744,073,709,551,615) |
 | `buyback` | `id`, unique `serial` | NPC shop sell history (newest 12 kept per character) |
 | `skill` | (`character_id`, `skill_group`) | learned skill per skill group (skill id = level), divergence |
@@ -56,12 +56,14 @@ legacy character-owned bank rows to the owning account. For duplicate group
 and slot rows, migration processes items by character ID and then serial: the
 first keeps its slot; later rows move to the lowest free slot.
 Capacities merge by maximum and increase as needed to cover migrated item
-slots, so a migrated capacity can exceed 384 to preserve existing slots; 384
-is the table-backed Add Slots ceiling, not an unconditional migration cap.
-Legacy bank-Zenny balances are summed with checked u128 arithmetic and must fit
-the u64 client field. V6 aborts before replacing tables if bank capacity or
-stack count exceeds u16, a bank slot is unrepresentable, or duplicate-slot
-relocation has no free slot.
+slots. The table-backed Add Slots expansion ceiling is 384; the separate
+migration and persisted-capacity ceiling is 32767, the maximum the client
+can represent as signed i16. Thus migration may preserve capacities above
+384, but never above 32767; a stored bank slot must be at most 32766 so
+slot+1 fits. Legacy bank-Zenny balances are summed with checked u128
+arithmetic and must fit the u64 client field. V6 aborts before replacing
+tables if bank capacity, item slot, or stack count is outside its client
+representation, or duplicate-slot relocation has no free slot.
 CHECK constraints reject negative currencies, zero item counts, and levels
 outside 1..255.
 
